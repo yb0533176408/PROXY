@@ -1,0 +1,111 @@
+name: GitHub Actions Proxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: "Unique run identifier"
+        required: true
+        default: "manual-run"
+
+permissions:
+  contents: write
+
+jobs:
+  proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Install packages
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y squid curl python3 python3-pip
+          python3 -m pip install --break-system-packages websockify
+
+      - name: Configure Squid
+        run: |
+          set -e
+          sudo tee /etc/squid/squid.conf > /dev/null <<'EOF'
+          http_port 127.0.0.1:3128
+          acl localhost src 127.0.0.1/32
+          http_access allow localhost
+          http_access deny all
+          cache deny all
+          access_log none
+          forwarded_for delete
+          via off
+          request_header_access X-Forwarded-For deny all
+          request_header_access Via deny all
+          EOF
+
+          sudo squid -k parse
+          sudo systemctl restart squid
+          sleep 2
+
+      - name: Start WebSocket bridge
+        run: |
+          set -e
+          nohup websockify 0.0.0.0:8080 127.0.0.1:3128 > websockify.log 2>&1 &
+          echo "$!" > websockify.pid
+          sleep 3
+
+      - name: Install Cloudflared
+        run: |
+          set -e
+          curl -L --fail --silent --show-error -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Start Cloudflare Quick Tunnel
+        run: |
+          set -e
+          rm -f tunnel.log tunnel.pid
+
+          nohup cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > tunnel.log 2>&1 &
+          echo "$!" > tunnel.pid
+
+          TUNNEL_URL=""
+          for i in {1..60}; do
+            TUNNEL_URL=$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' tunnel.log | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Cloudflare Quick Tunnel failed."
+            cat tunnel.log
+            exit 1
+          fi
+
+          WS_URL="${TUNNEL_URL/https:/wss:}"
+
+          echo ""
+          echo "=============================================="
+          echo " WebSocket: $WS_URL"
+          echo "=============================================="
+
+          BASE64_CONTENT=$(printf '{"url":"%s"}' "$WS_URL" | base64 -w0)
+
+          curl -s -X PUT \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/status/${{ inputs.topic }}.json" \
+            -d "{\"message\":\"proxy-url ${{ inputs.topic }}\",\"content\":\"$BASE64_CONTENT\"}"
+
+      - name: Keep Alive
+        run: |
+          while true; do
+            sleep 60
+            if ! sudo systemctl is-active --quiet squid; then
+              sudo systemctl restart squid
+            fi
+            if ! kill -0 "$(cat websockify.pid)" 2>/dev/null; then
+              exit 1
+            fi
+            if ! kill -0 "$(cat tunnel.pid)" 2>/dev/null; then
+              exit 1
+            fi
+          done
