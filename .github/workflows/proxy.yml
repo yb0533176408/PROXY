@@ -1,168 +1,35 @@
-name: GitHub Actions Proxy
+name: Run Async Proxy Server
 
 on:
-  workflow_dispatch:
-    inputs:
-      topic:
-        description: "Unique run identifier"
-        required: true
-        default: "manual-run"
-
-permissions:
-  contents: write
+  workflow_dispatch: # מאפשר הרצה ידנית מתוך ממשק ה-GitHub
+  push:
+    branches:
+      - main
 
 jobs:
-  proxy:
+  run-server:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
 
     steps:
-      - name: Install packages
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
         run: |
-          set -e
+          python -m pip install --upgrade pip
+          pip install aiohttp numpy uvloop httpx
+
+      - name: Install and start Squid (Local Proxy Service)
+        run: |
           sudo apt-get update
-          sudo apt-get install -y squid curl python3 python3-pip
-          python3 -m pip install --break-system-packages aiohttp
+          sudo apt-get install -y squid
+          sudo systemctl start squid
 
-      - name: Configure Squid
+      - name: Run Proxy Server
         run: |
-          set -e
-          sudo tee /etc/squid/squid.conf > /dev/null <<'EOF'
-          http_port 127.0.0.1:3128
-          acl localhost src 127.0.0.1/32
-          http_access allow localhost
-          http_access deny all
-          cache deny all
-          access_log none
-          forwarded_for delete
-          via off
-          request_header_access X-Forwarded-For deny all
-          request_header_access Via deny all
-          EOF
-
-          sudo squid -k parse
-          sudo systemctl restart squid
-          sleep 2
-
-      - name: Create Binary Stream HTTP Server Script
-        run: |
-          cat << 'EOF' > http_proxy_server.py
-          import asyncio
-          from aiohttp import web
-
-          SQUID_HOST = '127.0.0.1'
-          SQUID_PORT = 3128
-          SESSIONS = {}
-
-          XOR_KEY = b'MySecretKey12345'
-
-          def xor_crypt(data: bytes) -> bytes:
-              key_len = len(XOR_KEY)
-              return bytes([b ^ XOR_KEY[i % key_len] for i, b in enumerate(data)])
-
-          async def handle_stream(request):
-              session_id = request.headers.get('X-Session-ID')
-              if not session_id:
-                  return web.Response(status=400)
-
-              if session_id not in SESSIONS:
-                  try:
-                      reader, writer = await asyncio.wait_for(
-                          asyncio.open_connection(SQUID_HOST, SQUID_PORT), timeout=5.0
-                      )
-                      SESSIONS[session_id] = (reader, writer)
-                  except Exception:
-                      return web.Response(status=502)
-
-              reader, _ = SESSIONS[session_id]
-
-              response = web.StreamResponse(
-                  status=200,
-                  reason='OK',
-                  headers={
-                      'Content-Type': 'application/octet-stream',
-                      'Cache-Control': 'no-cache',
-                      'X-Accel-Buffering': 'no'
-                  }
-              )
-              await response.prepare(request)
-
-              try:
-                  while True:
-                      data = await reader.read(65536)
-                      if not data:
-                          break
-                      encrypted = xor_crypt(data)
-                      await response.write(encrypted)
-              except Exception:
-                  pass
-              finally:
-                  SESSIONS.pop(session_id, None)
-
-              return response
-
-          async def handle_send(request):
-              session_id = request.headers.get('X-Session-ID')
-              if not session_id or session_id not in SESSIONS:
-                  return web.Response(status=400)
-
-              _, writer = SESSIONS[session_id]
-
-              try:
-                  encrypted_data = await request.read()
-                  if encrypted_data:
-                      decrypted_data = xor_crypt(encrypted_data)
-                      writer.write(decrypted_data)
-                      await writer.drain()
-                  return web.Response(status=200)
-              except Exception:
-                  return web.Response(status=500)
-
-          app = web.Application()
-          app.router.add_get('/api/v1/stream', handle_stream)
-          app.router.add_post('/api/v1/send', handle_send)
-
-          if __name__ == '__main__':
-              web.run_app(app, host='0.0.0.0', port=8080)
-          EOF
-
-      - name: Start Binary Stream HTTP Server
-        run: |
-          set -e
-          nohup python3 http_proxy_server.py > server.log 2>&1 &
-          echo "$!" > server.pid
-          sleep 3
-
-      - name: Install Cloudflared
-        run: |
-          set -e
-          curl -L --fail --silent --show-error -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
-
-      - name: Start Cloudflare Named Tunnel
-        run: |
-          set -e
-          rm -f tunnel.log tunnel.pid
-
-          nohup cloudflared tunnel run --token ${{ secrets.CF_TUNNEL_TOKEN }} > tunnel.log 2>&1 &
-          echo "$!" > tunnel.pid
-
-          echo ""
-          echo "=============================================="
-          echo " Binary Stream API Active: https://1.tsoolgee.uk/api/v1/stream"
-          echo "=============================================="
-
-      - name: Keep Alive
-        run: |
-          while true; do
-            sleep 60
-            if ! sudo systemctl is-active --quiet squid; then
-              sudo systemctl restart squid
-            fi
-            if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
-              exit 1
-            fi
-            if ! kill -0 "$(cat tunnel.pid)" 2>/dev/null; then
-              exit 1
-            fi
-          done
+          python server.py
