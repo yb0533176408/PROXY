@@ -1,7 +1,7 @@
-name: Run Async Proxy Server
+name: Run Async Proxy Server with Cloudflare Tunnel
 
 on:
-  workflow_dispatch: # מאפשר הרצה ידנית מתוך ממשק ה-GitHub
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -24,12 +24,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install aiohttp numpy uvloop httpx
 
-      - name: Install and start Squid (Local Proxy Service)
+      - name: Install and start Squid Proxy
         run: |
           sudo apt-get update
           sudo apt-get install -y squid
           sudo systemctl start squid
 
-      - name: Run Proxy Server
+      - name: Run Proxy Server in background
         run: |
-          python server.py
+          # הרצת השרת ברקע כדי שה-Action ימשיך לשלב הבא
+          nohup python server.py > proxy_server.log 2>&1 &
+          sleep 3 # המתנה קלה לוודא שהשרת עלה
+
+      - name: Install Cloudflared
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Run Cloudflare Tunnel
+        env:
+          TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+        run: |
+          # הפעלת המנהרה שתחבר את התעבורה לשרת המקומי בגיטהאב
+          cloudflared tunnel --no-autoupdate run --token $TUNNEL_TOKEN
