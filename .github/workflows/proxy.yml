@@ -21,8 +21,7 @@ jobs:
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y squid curl python3 python3-pip
-          python3 -m pip install --break-system-packages websockify
+          sudo apt-get install -y squid curl python3 python3-pip python3-flask
 
       - name: Configure Squid
         run: |
@@ -44,11 +43,43 @@ jobs:
           sudo systemctl restart squid
           sleep 2
 
-      - name: Start WebSocket bridge
+      - name: Create HTTP Bridge Server Script
+        run: |
+          cat << 'EOF' > http_proxy_server.py
+          from flask import Flask, request, Response
+          import socket
+
+          app = Flask(__name__)
+          SQUID_ADDR = ('127.0.0.1', 3128)
+
+          @app.route('/tunnel', methods=['POST'])
+          def tunnel():
+              try:
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.connect(SQUID_ADDR)
+              except Exception as e:
+                  return f"Squid Connection Error: {e}", 502
+
+              def generate():
+                  s.sendall(request.get_data())
+                  while True:
+                      chunk = s.recv(4096)
+                      if not chunk:
+                          break
+                      yield chunk
+                  s.close()
+
+              return Response(generate(), content_type='application/octet-stream')
+
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0', port=8080)
+          EOF
+
+      - name: Start HTTP Bridge Server
         run: |
           set -e
-          nohup websockify 0.0.0.0:8080 127.0.0.1:3128 > websockify.log 2>&1 &
-          echo "$!" > websockify.pid
+          nohup python3 http_proxy_server.py > server.log 2>&1 &
+          echo "$!" > server.pid
           sleep 3
 
       - name: Install Cloudflared
@@ -65,20 +96,10 @@ jobs:
           nohup cloudflared tunnel run --token ${{ secrets.CF_TUNNEL_TOKEN }} > tunnel.log 2>&1 &
           echo "$!" > tunnel.pid
 
-          WS_URL="wss://1.tsoolgee.uk"
-
           echo ""
           echo "=============================================="
-          echo " WebSocket: $WS_URL"
+          echo " HTTP Tunnel Active: https://1.tsoolgee.uk/tunnel"
           echo "=============================================="
-
-          BASE64_CONTENT=$(printf '{"url":"%s"}' "$WS_URL" | base64 -w0)
-
-          curl -s -X PUT \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/contents/status/${{ inputs.topic }}.json" \
-            -d "{\"message\":\"proxy-url ${{ inputs.topic }}\",\"content\":\"$BASE64_CONTENT\"}"
 
       - name: Keep Alive
         run: |
@@ -87,7 +108,7 @@ jobs:
             if ! sudo systemctl is-active --quiet squid; then
               sudo systemctl restart squid
             fi
-            if ! kill -0 "$(cat websockify.pid)" 2>/dev/null; then
+            if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
               exit 1
             fi
             if ! kill -0 "$(cat tunnel.pid)" 2>/dev/null; then
