@@ -1,56 +1,69 @@
-from flask import Flask, request, jsonify, Response
-import socket
 import base64
+import zlib
+import asyncio
+from aiohttp import web
 
-app = Flask(__name__)
-SQUID_ADDR = ('127.0.0.1', 3128)
+SQUID_HOST = '127.0.0.1'
+SQUID_PORT = 3128
 SESSIONS = {}
 
-@app.route('/api/v1/update', methods=['POST'])
-def update_api():
-    data = request.get_json(silent=True) or {}
+async def handle_update(request):
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({'status': 'error', 'message': 'invalid json'}, status=400)
+
     session_id = data.get('session_id')
     raw_payload = data.get('payload', '')
 
     if not session_id:
-        return jsonify({'status': 'error', 'message': 'missing session'}), 400
+        return web.json_response({'status': 'error', 'message': 'missing session'}, status=400)
 
-    # התחברות ל-Squid עבור הסשן
+    # פתיחת חיבור אסינכרוני מול Squid במידה ולא קיים סשן
     if session_id not in SESSIONS:
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect(SQUID_ADDR)
-            s.settimeout(4.0)
-            SESSIONS[session_id] = s
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(SQUID_HOST, SQUID_PORT), timeout=4.0
+            )
+            SESSIONS[session_id] = (reader, writer)
         except Exception as e:
-            return jsonify({'status': 'error', 'details': str(e)}), 502
+            return web.json_response({'status': 'error', 'details': str(e)}, status=502)
 
-    s = SESSIONS[session_id]
+    reader, writer = SESSIONS[session_id]
 
-    # פענוח הנתונים ושליחה ל-Squid
+    # פענוח, חילוץ דחיסה ושליחה ל-Squid
     if raw_payload:
         try:
-            decoded_bytes = base64.b64decode(raw_payload)
-            s.sendall(decoded_bytes)
+            compressed_data = base64.b64decode(raw_payload)
+            decompressed_data = zlib.decompress(compressed_data)
+            writer.write(decompressed_data)
+            await writer.drain()
         except Exception:
             pass
 
-    # קריאת התשובה מ-Squid וקידוד חזרה ל-Base64
+    # קריאת התשובה מ-Squid, דחיסה וקידוד ל-Base64
     response_bytes = b""
     while True:
         try:
-            chunk = s.recv(4096)
+            chunk = await asyncio.wait_for(reader.read(65536), timeout=0.05)
             if not chunk:
                 break
             response_bytes += chunk
-        except socket.timeout:
+        except asyncio.TimeoutError:
             break
         except Exception:
             SESSIONS.pop(session_id, None)
             break
 
-    encoded_response = base64.b64encode(response_bytes).decode('utf-8')
-    return jsonify({'status': 'ok', 'data': encoded_response})
+    encoded_response = ""
+    if response_bytes:
+        compressed_res = zlib.compress(response_bytes)
+        encoded_response = base64.b64encode(compressed_res).decode('utf-8')
+
+    return web.json_response({'status': 'ok', 'data': encoded_response})
+
+app = web.Application()
+app.router.add_post('/api/v1/update', handle_update)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    web.run_app(app, host='0.0.0.0', port=8080)
