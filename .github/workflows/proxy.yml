@@ -57,30 +57,15 @@ jobs:
           curl -L --fail --silent --show-error -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
 
-      - name: Start Cloudflare Quick Tunnel
+      - name: Start Cloudflare Named Tunnel
         run: |
           set -e
           rm -f tunnel.log tunnel.pid
 
-          nohup cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > tunnel.log 2>&1 &
+          nohup cloudflared tunnel run --token ${{ secrets.CF_TUNNEL_TOKEN }} > tunnel.log 2>&1 &
           echo "$!" > tunnel.pid
 
-          TUNNEL_URL=""
-          for i in {1..60}; do
-            TUNNEL_URL=$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' tunnel.log | head -n 1 || true)
-            if [ -n "$TUNNEL_URL" ]; then
-              break
-            fi
-            sleep 2
-          done
-
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "Cloudflare Quick Tunnel failed."
-            cat tunnel.log
-            exit 1
-          fi
-
-          WS_URL="${TUNNEL_URL/https:/wss:}"
+          WS_URL="wss://1.tsoolgee.uk"
 
           echo ""
           echo "=============================================="
