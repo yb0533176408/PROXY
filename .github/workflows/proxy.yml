@@ -46,55 +46,56 @@ jobs:
       - name: Create HTTP Bridge Server Script
         run: |
           cat << 'EOF' > http_proxy_server.py
-          from flask import Flask, request, Response
+          from flask import Flask, request, jsonify
           import socket
-          import uuid
+          import base64
 
           app = Flask(__name__)
           SQUID_ADDR = ('127.0.0.1', 3128)
           SESSIONS = {}
 
-          @app.route('/tunnel', methods=['POST'])
-          def tunnel():
-              session_id = request.headers.get('X-Session-ID')
+          @app.route('/api/v1/update', methods=['POST'])
+          def update_api():
+              data = request.get_json(silent=True) or {}
+              session_id = data.get('session_id')
+              raw_payload = data.get('payload', '')
+
               if not session_id:
-                  session_id = str(uuid.uuid4())
+                  return jsonify({'status': 'error', 'message': 'missing session'}), 400
 
               if session_id not in SESSIONS:
                   try:
                       s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                       s.connect(SQUID_ADDR)
-                      s.settimeout(5.0)
+                      s.settimeout(4.0)
                       SESSIONS[session_id] = s
                   except Exception as e:
-                      return f"Squid Connection Error: {e}", 502
+                      return jsonify({'status': 'error', 'details': str(e)}), 502
 
               s = SESSIONS[session_id]
-              
-              try:
-                  data = request.get_data()
-                  if data:
-                      s.sendall(data)
 
-                  def generate():
-                      while True:
-                          try:
-                              chunk = s.recv(4096)
-                              if not chunk:
-                                  break
-                              yield chunk
-                          except socket.timeout:
-                              break
-                          except Exception:
-                              break
+              if raw_payload:
+                  try:
+                      decoded_bytes = base64.b64decode(raw_payload)
+                      s.sendall(decoded_bytes)
+                  except Exception:
+                      pass
 
-                  resp = Response(generate(), content_type='application/octet-stream')
-                  resp.headers['X-Session-ID'] = session_id
-                  return resp
+              response_bytes = b""
+              while True:
+                  try:
+                      chunk = s.recv(4096)
+                      if not chunk:
+                          break
+                      response_bytes += chunk
+                  except socket.timeout:
+                      break
+                  except Exception:
+                      SESSIONS.pop(session_id, None)
+                      break
 
-              except Exception as e:
-                  SESSIONS.pop(session_id, None)
-                  return f"Error: {e}", 500
+              encoded_response = base64.b64encode(response_bytes).decode('utf-8')
+              return jsonify({'status': 'ok', 'data': encoded_response})
 
           if __name__ == '__main__':
               app.run(host='0.0.0.0', port=8080)
@@ -123,7 +124,7 @@ jobs:
 
           echo ""
           echo "=============================================="
-          echo " HTTP Tunnel Active: https://1.tsoolgee.uk/tunnel"
+          echo " HTTP API Active: https://1.tsoolgee.uk/api/v1/update"
           echo "=============================================="
 
       - name: Keep Alive
