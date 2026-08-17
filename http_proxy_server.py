@@ -1,5 +1,3 @@
-import base64
-import zlib
 import asyncio
 from aiohttp import web
 
@@ -7,10 +5,17 @@ SQUID_HOST = '127.0.0.1'
 SQUID_PORT = 3128
 SESSIONS = {}
 
+# מפתח הצפנה קל (XOR Key) - ניתן לשנות למפתח באורך רצוי
+XOR_KEY = b'MySecretKey12345'
+
+def xor_crypt(data: bytes) -> bytes:
+    key_len = len(XOR_KEY)
+    return bytes([b ^ XOR_KEY[i % key_len] for i, b in enumerate(data)])
+
 async def handle_stream(request):
     session_id = request.headers.get('X-Session-ID')
     if not session_id:
-        return web.json_response({'status': 'error'}, status=400)
+        return web.Response(status=400)
 
     if session_id not in SESSIONS:
         try:
@@ -18,15 +23,19 @@ async def handle_stream(request):
                 asyncio.open_connection(SQUID_HOST, SQUID_PORT), timeout=5.0
             )
             SESSIONS[session_id] = (reader, writer)
-        except Exception as e:
-            return web.json_response({'status': 'error', 'details': str(e)}, status=502)
+        except Exception:
+            return web.Response(status=502)
 
-    reader, writer = SESSIONS[session_id]
+    reader, _ = SESSIONS[session_id]
 
     response = web.StreamResponse(
         status=200,
         reason='OK',
-        headers={'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-cache'}
+        headers={
+            'Content-Type': 'application/octet-stream',
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no'
+        }
     )
     await response.prepare(request)
 
@@ -35,9 +44,9 @@ async def handle_stream(request):
             data = await reader.read(65536)
             if not data:
                 break
-            compressed = zlib.compress(data)
-            encoded = base64.b64encode(compressed) + b'\n'
-            await response.write(encoded)
+            # הצפנת הנתונים לפני השליחה
+            encrypted = xor_crypt(data)
+            await response.write(encrypted)
     except Exception:
         pass
     finally:
@@ -46,24 +55,23 @@ async def handle_stream(request):
     return response
 
 async def handle_send(request):
+    session_id = request.headers.get('X-Session-ID')
+    if not session_id or session_id not in SESSIONS:
+        return web.Response(status=400)
+
+    _, writer = SESSIONS[session_id]
+
     try:
-        data = await request.json()
-    except Exception:
-        return web.json_response({'status': 'error'}, status=400)
-
-    session_id = data.get('session_id')
-    raw_payload = data.get('payload', '')
-
-    if session_id in SESSIONS and raw_payload:
-        _, writer = SESSIONS[session_id]
-        try:
-            decompressed = zlib.decompress(base64.b64decode(raw_payload))
-            writer.write(decompressed)
+        # קריאת בייטים גולמיים מגוף הבקשה
+        encrypted_data = await request.read()
+        if encrypted_data:
+            # פענוח ה-XOR וכתיבה ל-Squid
+            decrypted_data = xor_crypt(encrypted_data)
+            writer.write(decrypted_data)
             await writer.drain()
-        except Exception:
-            pass
-
-    return web.json_response({'status': 'ok'})
+        return web.Response(status=200)
+    except Exception:
+        return web.Response(status=500)
 
 app = web.Application()
 app.router.add_get('/api/v1/stream', handle_stream)
