@@ -1,157 +1,93 @@
-name: GitHub Actions Proxy
+import socket
+import threading
+import requests
+import logging
+import uuid
+import base64
+import zlib
 
-on:
-  workflow_dispatch:
-    inputs:
-      topic:
-        description: "Unique run identifier"
-        required: true
-        default: "manual-run"
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-permissions:
-  contents: write
+LOCAL_PORT = 8889
+STREAM_URL = "https://1.tsoolgee.uk/api/v1/stream"
+SEND_URL = "https://1.tsoolgee.uk/api/v1/send"
 
-jobs:
-  proxy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 350
+session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100)
+session.mount('https://', adapter)
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+})
 
-    steps:
-      - name: Install packages
-        run: |
-          set -e
-          sudo apt-get update
-          sudo apt-get install -y squid curl python3 python3-pip
-          python3 -m pip install --break-system-packages aiohttp
+def handle_client(client_socket, client_address):
+    session_id = str(uuid.uuid4())
+    logging.info(f"חיבור חדש [Session: {session_id[:8]}] מ: {client_address}")
 
-      - name: Configure Squid
-        run: |
-          set -e
-          sudo tee /etc/squid/squid.conf > /dev/null <<'EOF'
-          http_port 127.0.0.1:3128
-          acl localhost src 127.0.0.1/32
-          http_access allow localhost
-          http_access deny all
-          cache deny all
-          access_log none
-          forwarded_for delete
-          via off
-          request_header_access X-Forwarded-For deny all
-          request_header_access Via deny all
-          EOF
+    stop_event = threading.Event()
 
-          sudo squid -k parse
-          sudo systemctl restart squid
-          sleep 2
+    # תהליך קבלה ברצף (Streaming)
+    def receive_stream():
+        try:
+            res = session.get(
+                STREAM_URL,
+                headers={'X-Session-ID': session_id},
+                stream=True,
+                timeout=30
+            )
+            for line in res.iter_lines():
+                if stop_event.is_set():
+                    break
+                if line:
+                    compressed = base64.b64decode(line)
+                    raw_data = zlib.decompress(compressed)
+                    client_socket.sendall(raw_data)
+        except Exception:
+            pass
+        finally:
+            stop_event.set()
 
-      - name: Create Async HTTP Server Script
-        run: |
-          cat << 'EOF' > http_proxy_server.py
-          import base64
-          import zlib
-          import asyncio
-          from aiohttp import web
+    threading.Thread(target=receive_stream, daemon=True).start()
 
-          SQUID_HOST = '127.0.0.1'
-          SQUID_PORT = 3128
-          SESSIONS = {}
+    # תהליך שליחה
+    try:
+        client_socket.settimeout(15.0)
+        while not stop_event.is_set():
+            try:
+                data = client_socket.recv(65536)
+            except socket.timeout:
+                continue
 
-          async def handle_update(request):
-              try:
-                  data = await request.json()
-              except Exception:
-                  return web.json_response({'status': 'error', 'message': 'invalid json'}, status=400)
+            if not data:
+                break
 
-              session_id = data.get('session_id')
-              raw_payload = data.get('payload', '')
+            compressed = zlib.compress(data)
+            encoded = base64.b64encode(compressed).decode('utf-8')
 
-              if not session_id:
-                  return web.json_response({'status': 'error', 'message': 'missing session'}, status=400)
+            session.post(
+                SEND_URL,
+                json={'session_id': session_id, 'payload': encoded},
+                timeout=10
+            )
+    except Exception as e:
+        logging.error(f"שגיאה בסשן {session_id[:8]}: {e}")
+    finally:
+        stop_event.set()
+        try:
+            client_socket.close()
+        except:
+            pass
+        logging.info(f"נסגר החיבור [Session: {session_id[:8]}]")
 
-              if session_id not in SESSIONS:
-                  try:
-                      reader, writer = await asyncio.wait_for(
-                          asyncio.open_connection(SQUID_HOST, SQUID_PORT), timeout=4.0
-                      )
-                      SESSIONS[session_id] = (reader, writer)
-                  except Exception as e:
-                      return web.json_response({'status': 'error', 'details': str(e)}, status=502)
+def main():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(('127.0.0.1', LOCAL_PORT))
+    server.listen(100)
+    logging.info(f"מתווך Streaming Proxy מואץ פעיל ב-127.0.0.1:{LOCAL_PORT}")
 
-              reader, writer = SESSIONS[session_id]
+    while True:
+        client, addr = server.accept()
+        threading.Thread(target=handle_client, args=(client, addr), daemon=True).start()
 
-              if raw_payload:
-                  try:
-                      compressed_data = base64.b64decode(raw_payload)
-                      decompressed_data = zlib.decompress(compressed_data)
-                      writer.write(decompressed_data)
-                      await writer.drain()
-                  except Exception:
-                      pass
-
-              response_bytes = b""
-              while True:
-                  try:
-                      chunk = await asyncio.wait_for(reader.read(65536), timeout=0.05)
-                      if not chunk:
-                          break
-                      response_bytes += chunk
-                  except asyncio.TimeoutError:
-                      break
-                  except Exception:
-                      SESSIONS.pop(session_id, None)
-                      break
-
-              encoded_response = ""
-              if response_bytes:
-                  compressed_res = zlib.compress(response_bytes)
-                  encoded_response = base64.b64encode(compressed_res).decode('utf-8')
-
-              return web.json_response({'status': 'ok', 'data': encoded_response})
-
-          app = web.Application()
-          app.router.add_post('/api/v1/update', handle_update)
-
-          if __name__ == '__main__':
-              web.run_app(app, host='0.0.0.0', port=8080)
-          EOF
-
-      - name: Start Async HTTP Server
-        run: |
-          set -e
-          nohup python3 http_proxy_server.py > server.log 2>&1 &
-          echo "$!" > server.pid
-          sleep 3
-
-      - name: Install Cloudflared
-        run: |
-          set -e
-          curl -L --fail --silent --show-error -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
-
-      - name: Start Cloudflare Named Tunnel
-        run: |
-          set -e
-          rm -f tunnel.log tunnel.pid
-
-          nohup cloudflared tunnel run --token ${{ secrets.CF_TUNNEL_TOKEN }} > tunnel.log 2>&1 &
-          echo "$!" > tunnel.pid
-
-          echo ""
-          echo "=============================================="
-          echo " Accelerated Proxy API Active: https://1.tsoolgee.uk/api/v1/update"
-          echo "=============================================="
-
-      - name: Keep Alive
-        run: |
-          while true; do
-            sleep 60
-            if ! sudo systemctl is-active --quiet squid; then
-              sudo systemctl restart squid
-            fi
-            if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
-              exit 1
-            fi
-            if ! kill -0 "$(cat tunnel.pid)" 2>/dev/null; then
-              exit 1
-            fi
-          done
+if __name__ == '__main__':
+    main()
