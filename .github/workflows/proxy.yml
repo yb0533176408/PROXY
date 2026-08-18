@@ -28,13 +28,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y squid
-          sudo systemctl start squid
+          # systemctl start squid נתקע לפעמים על הרנר; מפעילים ישירות במקום.
+          sudo squid -z 2>/dev/null || true
+          sudo service squid start 2>/dev/null || sudo squid 2>/dev/null || true
+          sleep 3
+          sudo ss -ltnp 2>/dev/null | grep ':3128' && echo "squid OK on 3128" || echo "WARN: squid not on 3128"
 
       - name: Run Proxy Server in background
         run: |
-          # הרצת השרת ברקע כדי שה-Action ימשיך לשלב הבא
           nohup python server.py > proxy_server.log 2>&1 &
-          sleep 3 # המתנה קלה לוודא שהשרת עלה
+          sleep 4
+          sudo ss -ltnp 2>/dev/null | grep ':8080' && echo "server.py OK on 8080" || { echo "server.py NOT up:"; cat proxy_server.log; }
 
       - name: Install Cloudflared
         run: |
@@ -45,5 +49,4 @@ jobs:
         env:
           TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          # הפעלת המנהרה שתחבר את התעבורה לשרת המקומי בגיטהאב
           cloudflared tunnel --no-autoupdate run --token $TUNNEL_TOKEN
