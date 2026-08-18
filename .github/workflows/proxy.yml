@@ -19,26 +19,27 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install websockify
         run: |
           python -m pip install --upgrade pip
-          pip install aiohttp numpy uvloop httpx
+          pip install websockify numpy
 
       - name: Install and start Squid Proxy
         run: |
           sudo apt-get update
           sudo apt-get install -y squid
-          # systemctl start squid נתקע לפעמים על הרנר; מפעילים ישירות במקום.
           sudo squid -z 2>/dev/null || true
           sudo service squid start 2>/dev/null || sudo squid 2>/dev/null || true
           sleep 3
           sudo ss -ltnp 2>/dev/null | grep ':3128' && echo "squid OK on 3128" || echo "WARN: squid not on 3128"
 
-      - name: Run Proxy Server in background
+      # WebSocket -> Squid  (זו ה"שפה הישנה" שה-ProxyClient.exe מדבר).
+      # NetFree מעביר WebSocket חי frame-by-frame, בלי ה-buffering ששובר HTTP-streaming.
+      - name: Start websockify (WS 8080 -> Squid 3128)
         run: |
-          nohup python server.py > proxy_server.log 2>&1 &
-          sleep 4
-          sudo ss -ltnp 2>/dev/null | grep ':8080' && echo "server.py OK on 8080" || { echo "server.py NOT up:"; cat proxy_server.log; }
+          nohup websockify 0.0.0.0:8080 127.0.0.1:3128 > ws.log 2>&1 &
+          sleep 5
+          sudo ss -ltnp 2>/dev/null | grep ':8080' && echo "websockify OK on 8080" || { echo "websockify NOT up:"; cat ws.log; }
 
       - name: Install Cloudflared
         run: |
