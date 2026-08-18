@@ -14,45 +14,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
+      - name: Download Xray-core
         run: |
-          python -m pip install --upgrade pip
-          pip install aiohttp numpy uvloop httpx requests
+          curl -L -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -o xray.zip xray geoip.dat geosite.dat 2>/dev/null || unzip -o xray.zip
+          chmod +x xray
+          ./xray version | head -2
 
-      - name: Install and start Squid Proxy
+      - name: Run Xray (VLESS + XHTTP on :8080)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y squid
-          sudo squid -z 2>/dev/null || true
-          sudo service squid start 2>/dev/null || sudo squid 2>/dev/null || true
-          sleep 3
-          sudo ss -ltnp 2>/dev/null | grep ':3128' && echo "squid OK on 3128" || echo "WARN: squid not on 3128"
-
-      - name: Run Proxy Server in background
-        run: |
-          nohup python server.py > proxy_server.log 2>&1 &
+          nohup ./xray run -c xray_config.json > xray.log 2>&1 &
           sleep 4
-          sudo ss -ltnp 2>/dev/null | grep ':8080' && echo "server.py OK on 8080" || { echo "server.py NOT up:"; cat proxy_server.log; }
-
-      # בדיקה עצמית: האם server.py + Squid מספקים נתונים בכלל? (על הרנר, בלי NetFree/Cloudflare)
-      - name: SELF-TEST server.py + Squid locally
-        run: |
-          python selftest.py || true
-          echo "===== selftest.txt ====="
-          cat selftest.txt || echo "no selftest.txt"
-
-      - name: Upload self-test result
-        uses: actions/upload-artifact@v4
-        with:
-          name: selftest
-          path: selftest.txt
-          retention-days: 1
-          if-no-files-found: warn
+          sudo ss -ltnp 2>/dev/null | grep ':8080' && echo "xray OK on 8080" || { echo "xray NOT up:"; cat xray.log; }
 
       - name: Install Cloudflared
         run: |
