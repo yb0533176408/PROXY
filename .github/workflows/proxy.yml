@@ -1,4 +1,4 @@
-name: Run Async Proxy Server with Cloudflare Tunnel
+name: Run Async Proxy Server with localtunnel
 
 on:
   workflow_dispatch:
@@ -21,19 +21,52 @@ jobs:
           chmod +x xray
           ./xray version | head -2
 
-      - name: Run Xray (VLESS + XHTTP on :8080)
+      - name: Run Xray (VMess + XHTTP on :8080)
         run: |
           nohup ./xray run -c xray_config.json > xray.log 2>&1 &
           sleep 4
           sudo ss -ltnp 2>/dev/null | grep ':8080' && echo "xray OK on 8080" || { echo "xray NOT up:"; cat xray.log; }
 
-      - name: Install Cloudflared
-        run: |
-          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
+      # kept as its own step: bundling it with the launch has hung before
+      - name: Install localtunnel
+        run: npm install -g localtunnel
 
-      - name: Run Cloudflare Tunnel
-        env:
-          TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+      - name: Start localtunnel
         run: |
-          cloudflared tunnel --no-autoupdate run --token $TUNNEL_TOKEN
+          nohup lt --port 8080 --subdomain tsoolgee-xh > lt.log 2>&1 &
+          for i in $(seq 1 45); do
+            URL=$(grep -oE 'https://[a-z0-9.-]+\.loca\.lt' lt.log | head -1)
+            if [ -n "$URL" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$URL" ]; then echo "localtunnel failed to start:"; cat lt.log; exit 1; fi
+          echo "$URL" > tunnel_url.txt
+          echo "TUNNEL URL: $URL"
+
+      - name: Publish tunnel URL
+        uses: actions/upload-artifact@v4
+        with:
+          name: tunnel-url
+          path: tunnel_url.txt
+
+      - name: Self-check through the tunnel
+        continue-on-error: true
+        run: |
+          URL=$(cat tunnel_url.txt)
+          curl -s -o /dev/null -w "direct  /xh -> %{http_code}\n" http://127.0.0.1:8080/xh
+          for i in 1 2 3; do
+            curl -s -o /dev/null -w "tunnel  /xh -> %{http_code}\n" \
+              -H "bypass-tunnel-reminder: 1" "$URL/xh" || true
+            sleep 3
+          done
+
+      # loca.lt drops connections occasionally; bring it straight back up
+      - name: Keep alive
+        run: |
+          for i in $(seq 1 350); do
+            if ! pgrep -f "lt --port 8080" > /dev/null; then
+              echo "$(date -u +%H:%M:%S) localtunnel died - restarting"
+              nohup lt --port 8080 --subdomain tsoolgee-xh > lt.log 2>&1 &
+            fi
+            sleep 60
+          done
