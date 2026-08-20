@@ -68,12 +68,14 @@ class Handler(BaseHTTPRequestHandler):
     def _probe(self, qs):
         """Parametrized stream probe for locating a buffering threshold.
 
-        GET /probe?pad=N&interval_ms=M&count=C&linelen=L
+        GET /probe?pad=N&interval_ms=M&count=C&linelen=L&ct=TYPE&sse=1
 
           pad         bytes of filler written as the very first body chunk
           interval_ms delay between the timestamped lines that follow
           count       how many timestamped lines to write
           linelen     each timestamped line is padded to this many bytes
+          ct          Content-Type to advertise (default text/plain)
+          sse=1       wrap each line in SSE framing ("data: ...\n\n")
 
         The client stamps the arrival time of every line. Comparing arrival
         times across pad/linelen/interval combinations separates a byte
@@ -93,8 +95,12 @@ class Handler(BaseHTTPRequestHandler):
         count = num("count", 15, 1, 300)
         linelen = num("linelen", 0, 0, 1024 * 1024)
 
+        ct = qs.get("ct", ["text/plain; charset=utf-8"])[0]
+        ct = "".join(c for c in ct if 32 <= ord(c) < 127)[:120] or "text/plain"
+        sse = qs.get("sse", ["0"])[0] == "1"
+
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Type", ct)
         self.send_header("Cache-Control", "no-cache, no-store")
         self.send_header("X-Accel-Buffering", "no")
         self.send_header("Transfer-Encoding", "chunked")
@@ -115,6 +121,8 @@ class Handler(BaseHTTPRequestHandler):
                 # 'prev' = body bytes already written before this line.
                 line = "L %03d srv %.3f prev %d\n" % (
                     i, time.time() - start, self._cum)
+                if sse:
+                    line = "data: " + line[:-1] + "\n\n"
                 b = line.encode()
                 if linelen > len(b):
                     b = b[:-1] + b"x" * (linelen - len(b)) + b"\n"
