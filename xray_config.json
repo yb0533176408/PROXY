@@ -7,19 +7,21 @@
       "protocol": "vmess",
       "settings": {
         "clients": [
-          { "id": "b7d37230-8508-4f0d-bd14-21d09c93eb9f" }
+          { "id": "b7d37230-8508-4f0d-bd14-21d09c93eb9f", "alterId": 0 }
         ]
       },
       "streamSettings": {
-        "network": "xhttp",
-        "xhttpSettings": {
-          "path": "/xh",
-          "mode": "auto"
-        }
+        "network": "ws",
+        "wsSettings": { "path": "/xh" },
+        "sockopt": { "tcpNoDelay": true, "tcpFastOpen": true }
       }
     }
   ],
   "outbounds": [
-    { "protocol": "freedom" }
+    {
+      "protocol": "freedom",
+      "settings": { "domainStrategy": "UseIP" },
+      "streamSettings": { "sockopt": { "tcpNoDelay": true, "tcpFastOpen": true } }
+    }
   ]
 }

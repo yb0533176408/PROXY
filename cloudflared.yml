@@ -1,0 +1,8 @@
+tunnel: bbdb43b5-0cb3-4119-a9e8-a0491d60eeb8
+credentials-file: /home/runner/creds.json
+protocol: quic
+no-autoupdate: true
+ingress:
+  - hostname: 1.tsoolgee.uk
+    service: http://localhost:8080
+  - service: http_status:404

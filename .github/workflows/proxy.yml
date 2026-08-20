@@ -1,4 +1,4 @@
-name: Run Async Proxy Server with localtunnel
+name: VMess+WS proxy via Cloudflare Tunnel
 
 on:
   workflow_dispatch:
@@ -6,67 +6,91 @@ on:
     branches:
       - main
 
+concurrency:
+  group: proxy-server
+  cancel-in-progress: true
+
 jobs:
   run-server:
     runs-on: ubuntu-latest
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Tune kernel for high-RTT throughput (BBR + big buffers)
+        run: |
+          sudo sysctl -w net.core.default_qdisc=fq
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+          sudo sysctl -w net.core.rmem_max=268435456
+          sudo sysctl -w net.core.wmem_max=268435456
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 268435456"
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 268435456"
+          sudo sysctl -w net.ipv4.tcp_fastopen=3
+          sudo sysctl -w net.ipv4.tcp_mtu_probing=1
+          echo "cc=$(sysctl -n net.ipv4.tcp_congestion_control) qdisc=$(sysctl -n net.core.default_qdisc)"
+
       - name: Download Xray-core
         run: |
           curl -L -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-          unzip -o xray.zip xray geoip.dat geosite.dat 2>/dev/null || unzip -o xray.zip
+          unzip -o xray.zip xray 2>/dev/null || unzip -o xray.zip
           chmod +x xray
           ./xray version | head -2
 
-      - name: Run Xray (VMess + XHTTP on :8080)
+      - name: Run Xray (VMess + WS on :8080)
         run: |
           nohup ./xray run -c xray_config.json > xray.log 2>&1 &
           sleep 4
-          sudo ss -ltnp 2>/dev/null | grep ':8080' && echo "xray OK on 8080" || { echo "xray NOT up:"; cat xray.log; }
+          ss -ltnp 2>/dev/null | grep ':8080' && echo "xray OK on 8080" || { echo "xray NOT up:"; cat xray.log; exit 1; }
 
-      # kept as its own step: bundling it with the launch has hung before
-      - name: Install localtunnel
-        run: npm install -g localtunnel
-
-      - name: Start localtunnel
+      - name: Install cloudflared
         run: |
-          nohup lt --port 8080 --subdomain tsoolgee-xh > lt.log 2>&1 &
-          for i in $(seq 1 45); do
-            URL=$(grep -oE 'https://[a-z0-9.-]+\.loca\.lt' lt.log | head -1)
-            if [ -n "$URL" ]; then break; fi
+          curl -L -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          cloudflared --version
+
+      - name: Build tunnel credentials from token
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import os, base64, json
+          t = os.environ['CF_TUNNEL_TOKEN'].strip()
+          d = json.loads(base64.b64decode(t + '=='*(-len(t) % 4)))
+          json.dump({"AccountTag": d["a"], "TunnelID": d["t"],
+                     "TunnelSecret": d["s"], "Endpoint": ""},
+                    open("/home/runner/creds.json", "w"))
+          print("token is for tunnel:", d["t"])
+          PY
+
+      - name: Run Cloudflare Tunnel
+        run: |
+          nohup cloudflared tunnel --config cloudflared.yml run > cf.log 2>&1 &
+          for i in $(seq 1 20); do
+            grep -qiE "Registered tunnel connection" cf.log && break
             sleep 2
           done
-          if [ -z "$URL" ]; then echo "localtunnel failed to start:"; cat lt.log; exit 1; fi
-          echo "$URL" > tunnel_url.txt
-          echo "TUNNEL URL: $URL"
+          echo "--- cloudflared log ---"; tail -20 cf.log
+          grep -qiE "Registered tunnel connection" cf.log || echo "WARN: tunnel not registered yet"
 
-      - name: Publish tunnel URL
-        uses: actions/upload-artifact@v4
-        with:
-          name: tunnel-url
-          path: tunnel_url.txt
-
-      - name: Self-check through the tunnel
+      - name: Self-check
         continue-on-error: true
         run: |
-          URL=$(cat tunnel_url.txt)
-          curl -s -o /dev/null -w "direct  /xh -> %{http_code}\n" http://127.0.0.1:8080/xh
+          curl -s -o /dev/null -w "local  8080/xh        -> %{http_code}\n" http://127.0.0.1:8080/xh
           for i in 1 2 3; do
-            curl -s -o /dev/null -w "tunnel  /xh -> %{http_code}\n" \
-              -H "bypass-tunnel-reminder: 1" "$URL/xh" || true
+            curl -s -o /dev/null -w "edge  1.tsoolgee.uk/xh -> %{http_code}\n" https://1.tsoolgee.uk/xh || true
             sleep 3
           done
 
-      # loca.lt drops connections occasionally; bring it straight back up
-      - name: Keep alive
+      - name: Keep alive (~5h40m, under 6h cap) + restart cloudflared if it dies
         run: |
-          for i in $(seq 1 350); do
-            if ! pgrep -f "lt --port 8080" > /dev/null; then
-              echo "$(date -u +%H:%M:%S) localtunnel died - restarting"
-              nohup lt --port 8080 --subdomain tsoolgee-xh > lt.log 2>&1 &
+          for i in $(seq 1 340); do
+            if ! pgrep -f "cloudflared tunnel" > /dev/null; then
+              echo "$(date -u +%H:%M:%S) cloudflared died - restarting"
+              nohup cloudflared tunnel --config cloudflared.yml run >> cf.log 2>&1 &
+            fi
+            if ! pgrep -f "xray run" > /dev/null; then
+              echo "$(date -u +%H:%M:%S) xray died - restarting"
+              nohup ./xray run -c xray_config.json >> xray.log 2>&1 &
             fi
             sleep 60
           done
