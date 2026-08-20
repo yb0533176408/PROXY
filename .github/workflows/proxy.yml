@@ -39,7 +39,7 @@ jobs:
       - name: Run Xray (VMess + XHTTP on :8080) + decoy site (:8081)
         run: |
           nohup ./xray run -c xray_config.json > xray.log 2>&1 &
-          nohup python3 -m http.server 8081 --directory decoy > decoy.log 2>&1 &
+          nohup python3 decoy/serve.py 8081 > decoy.log 2>&1 &
           sleep 4
           ss -ltnp 2>/dev/null | grep ':8080' && echo "xray OK" || { echo "xray NOT up:"; cat xray.log; exit 1; }
           ss -ltnp 2>/dev/null | grep ':8081' && echo "decoy OK" || { echo "decoy NOT up:"; cat decoy.log; }
@@ -109,12 +109,14 @@ jobs:
           nohup ./xray run -c client_test.json > client.log 2>&1 &
           sleep 4
           IP=$(curl -s --max-time 25 --socks5-hostname 127.0.0.1:10808 https://ipinfo.io/ip || true)
-          if [ -n "$IP" ]; then echo "E2E=OK egress_ip=$IP"; else echo "E2E=FAIL"; tail -20 client.log; tail -20 xray.log; fi
+          if [ -n "$IP" ]; then echo "E2E=OK egress_ip=$IP" | tee /home/runner/e2e.txt;
+          else echo "E2E=FAIL" | tee /home/runner/e2e.txt; tail -20 client.log; tail -20 xray.log; fi
           pkill -f "client_test.json" || true
 
       - name: Self-check + diagnostics
         run: |
           {
+            echo "=== E2E (runner -> edge -> xray) ==="; cat /home/runner/e2e.txt 2>/dev/null || echo "no result"
             echo "=== TUNNEL_ID ==="; cat /home/runner/tunnel_id.txt
             echo "=== local xray 8080/xh (bare GET, 404/400 is normal) ==="
             curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/xh
@@ -142,6 +144,6 @@ jobs:
           for i in $(seq 1 340); do
             pgrep -f "cloudflared tunnel" >/dev/null || { echo cf-restart; nohup cloudflared tunnel --config cloudflared.yml run >> cf.log 2>&1 & }
             pgrep -f "xray run -c xray_config.json" >/dev/null || { echo xray-restart; nohup ./xray run -c xray_config.json >> xray.log 2>&1 & }
-            pgrep -f "http.server 8081" >/dev/null || { echo decoy-restart; nohup python3 -m http.server 8081 --directory decoy >> decoy.log 2>&1 & }
+            pgrep -f "decoy/serve.py" >/dev/null || { echo decoy-restart; nohup python3 decoy/serve.py 8081 >> decoy.log 2>&1 & }
             sleep 60
           done
