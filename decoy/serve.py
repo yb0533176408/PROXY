@@ -65,6 +65,67 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _probe(self, qs):
+        """Parametrized stream probe for locating a buffering threshold.
+
+        GET /probe?pad=N&interval_ms=M&count=C&linelen=L
+
+          pad         bytes of filler written as the very first body chunk
+          interval_ms delay between the timestamped lines that follow
+          count       how many timestamped lines to write
+          linelen     each timestamped line is padded to this many bytes
+
+        The client stamps the arrival time of every line. Comparing arrival
+        times across pad/linelen/interval combinations separates a byte
+        threshold (release depends on bytes accumulated) from a time
+        threshold (release depends on wall-clock seconds).
+        """
+
+        def num(name, default, lo, hi):
+            try:
+                v = int(qs.get(name, [str(default)])[0])
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        pad = num("pad", 0, 0, 8 * 1024 * 1024)
+        interval_ms = num("interval_ms", 1000, 0, 60000)
+        count = num("count", 15, 1, 300)
+        linelen = num("linelen", 0, 0, 1024 * 1024)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        start = time.time()
+        self._cum = 0
+
+        def emit(payload):
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(payload), payload))
+            self.wfile.flush()
+            self._cum += len(payload)
+
+        try:
+            if pad:
+                emit(b"P" * pad)
+            for i in range(count):
+                # 'prev' = body bytes already written before this line.
+                line = "L %03d srv %.3f prev %d\n" % (
+                    i, time.time() - start, self._cum)
+                b = line.encode()
+                if linelen > len(b):
+                    b = b[:-1] + b"x" * (linelen - len(b)) + b"\n"
+                emit(b)
+                if i != count - 1 and interval_ms:
+                    time.sleep(interval_ms / 1000.0)
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _dl(self, qs):
         mb = min(int(qs.get("mb", ["8"])[0]), 128)
         total = mb * 1024 * 1024
@@ -86,6 +147,8 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/sse":
             self._sse()
+        elif u.path == "/probe":
+            self._probe(parse_qs(u.query))
         elif u.path == "/dl":
             self._dl(parse_qs(u.query))
         else:
