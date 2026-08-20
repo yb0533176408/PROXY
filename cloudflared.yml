@@ -1,8 +1,18 @@
-tunnel: bbdb43b5-0cb3-4119-a9e8-a0491d60eeb8
+tunnel: __TUNNEL_ID__
 credentials-file: /home/runner/creds.json
 protocol: quic
 no-autoupdate: true
+originRequest:
+  noTLSVerify: true
 ingress:
   - hostname: 1.tsoolgee.uk
+    path: ^/xh
     service: http://localhost:8080
+  - hostname: 1.tsoolgee.uk
+    service: http://localhost:8081
+  - hostname: cdn.tsoolgee.uk
+    path: ^/xh
+    service: http://localhost:8080
+  - hostname: cdn.tsoolgee.uk
+    service: http://localhost:8081
   - service: http_status:404
