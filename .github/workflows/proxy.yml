@@ -48,7 +48,7 @@ jobs:
           sudo dpkg -i cloudflared.deb
           cloudflared --version
 
-      - name: Build tunnel credentials from token
+      - name: Build tunnel credentials + config from token
         env:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
@@ -56,10 +56,21 @@ jobs:
           import os, base64, json
           t = os.environ['CF_TUNNEL_TOKEN'].strip()
           d = json.loads(base64.b64decode(t + '=='*(-len(t) % 4)))
-          json.dump({"AccountTag": d["a"], "TunnelID": d["t"],
+          tid = d["t"]
+          json.dump({"AccountTag": d["a"], "TunnelID": tid,
                      "TunnelSecret": d["s"], "Endpoint": ""},
                     open("/home/runner/creds.json", "w"))
-          print("token is for tunnel:", d["t"])
+          cfg = ("tunnel: %s\n"
+                 "credentials-file: /home/runner/creds.json\n"
+                 "protocol: quic\n"
+                 "no-autoupdate: true\n"
+                 "ingress:\n"
+                 "  - hostname: 1.tsoolgee.uk\n"
+                 "    service: http://localhost:8080\n"
+                 "  - service: http_status:404\n") % tid
+          open("cloudflared.yml", "w").write(cfg)
+          open("/home/runner/tunnel_id.txt", "w").write(tid + "\n")
+          print("SECRET_TUNNEL_ID=" + tid)
           PY
 
       - name: Run Cloudflare Tunnel
@@ -69,28 +80,33 @@ jobs:
             grep -qiE "Registered tunnel connection" cf.log && break
             sleep 2
           done
-          echo "--- cloudflared log ---"; tail -20 cf.log
-          grep -qiE "Registered tunnel connection" cf.log || echo "WARN: tunnel not registered yet"
+          tail -25 cf.log || true
 
-      - name: Self-check
-        continue-on-error: true
+      - name: Self-check + collect diagnostics
         run: |
-          curl -s -o /dev/null -w "local  8080/xh        -> %{http_code}\n" http://127.0.0.1:8080/xh
-          for i in 1 2 3; do
-            curl -s -o /dev/null -w "edge  1.tsoolgee.uk/xh -> %{http_code}\n" https://1.tsoolgee.uk/xh || true
-            sleep 3
-          done
+          {
+            echo "=== SECRET_TUNNEL_ID ==="; cat /home/runner/tunnel_id.txt
+            echo "=== local 8080/xh ==="
+            curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/xh || true
+            echo "=== edge 1.tsoolgee.uk/xh (x3) ==="
+            for i in 1 2 3; do curl -s -o /dev/null -w "%{http_code}\n" https://1.tsoolgee.uk/xh || true; sleep 2; done
+            echo "=== cloudflared registration ==="
+            grep -iE "Registered tunnel connection|Starting tunnel|connIndex|error|unauthorized|not found" cf.log | head -15
+            echo "=== xray.log tail ==="; tail -15 xray.log
+          } > diag.txt 2>&1
+          cat diag.txt
 
-      - name: Keep alive (~5h40m, under 6h cap) + restart cloudflared if it dies
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag
+          path: diag.txt
+          retention-days: 1
+
+      - name: Keep alive (~5h40m) + restart on death
         run: |
           for i in $(seq 1 340); do
-            if ! pgrep -f "cloudflared tunnel" > /dev/null; then
-              echo "$(date -u +%H:%M:%S) cloudflared died - restarting"
-              nohup cloudflared tunnel --config cloudflared.yml run >> cf.log 2>&1 &
-            fi
-            if ! pgrep -f "xray run" > /dev/null; then
-              echo "$(date -u +%H:%M:%S) xray died - restarting"
-              nohup ./xray run -c xray_config.json >> xray.log 2>&1 &
-            fi
+            pgrep -f "cloudflared tunnel" > /dev/null || { echo "cf restart"; nohup cloudflared tunnel --config cloudflared.yml run >> cf.log 2>&1 & }
+            pgrep -f "xray run" > /dev/null || { echo "xray restart"; nohup ./xray run -c xray_config.json >> xray.log 2>&1 & }
             sleep 60
           done
