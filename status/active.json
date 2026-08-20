@@ -1,1 +1,23 @@
-{"url": "wss://1.tsoolgee.uk"}
+{
+  "transport": "vmess+xhttp",
+  "note": "XHTTP (plain HTTP POST/GET, no Upgrade handshake). WebSocket is gone.",
+  "url": "https://1.tsoolgee.uk/xh",
+  "server": {
+    "address": "1.tsoolgee.uk",
+    "fallback": "cdn.tsoolgee.uk",
+    "port": 443,
+    "tls": true,
+    "sni": "1.tsoolgee.uk",
+    "network": "xhttp",
+    "path": "/xh",
+    "mode": "packet-up",
+    "protocol": "vmess",
+    "id": "b7d37230-8508-4f0d-bd14-21d09c93eb9f",
+    "alterId": 0,
+    "security": "auto"
+  },
+  "share_links": {
+    "1.tsoolgee.uk": "vmess://eyJ2IjoiMiIsInBzIjoiWEhUVFAgMS50c29vbGdlZS51ayIsImFkZCI6IjEudHNvb2xnZWUudWsiLCJwb3J0IjoiNDQzIiwiaWQiOiJiN2QzNzIzMC04NTA4LTRmMGQtYmQxNC0yMWQwOWM5M2ViOWYiLCJhaWQiOiIwIiwic2N5IjoiYXV0byIsIm5ldCI6InhodHRwIiwidHlwZSI6Im5vbmUiLCJob3N0IjoiMS50c29vbGdlZS51ayIsInBhdGgiOiIveGgiLCJtb2RlIjoicGFja2V0LXVwIiwidGxzIjoidGxzIiwic25pIjoiMS50c29vbGdlZS51ayIsImFscG4iOiJoMixodHRwLzEuMSIsImZwIjoiY2hyb21lIn0=",
+    "cdn.tsoolgee.uk": "vmess://eyJ2IjoiMiIsInBzIjoiWEhUVFAgY2RuLnRzb29sZ2VlLnVrIiwiYWRkIjoiY2RuLnRzb29sZ2VlLnVrIiwicG9ydCI6IjQ0MyIsImlkIjoiYjdkMzcyMzAtODUwOC00ZjBkLWJkMTQtMjFkMDljOTNlYjlmIiwiYWlkIjoiMCIsInNjeSI6ImF1dG8iLCJuZXQiOiJ4aHR0cCIsInR5cGUiOiJub25lIiwiaG9zdCI6ImNkbi50c29vbGdlZS51ayIsInBhdGgiOiIveGgiLCJtb2RlIjoicGFja2V0LXVwIiwidGxzIjoidGxzIiwic25pIjoiY2RuLnRzb29sZ2VlLnVrIiwiYWxwbiI6ImgyLGh0dHAvMS4xIiwiZnAiOiJjaHJvbWUifQ=="
+  }
+}

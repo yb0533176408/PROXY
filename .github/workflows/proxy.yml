@@ -1,4 +1,4 @@
-name: VMess+WS proxy via Cloudflare Tunnel
+name: VMess+XHTTP proxy via Cloudflare Tunnel
 
 on:
   workflow_dispatch:
@@ -36,7 +36,7 @@ jobs:
           chmod +x xray
           ./xray version | head -2
 
-      - name: Run Xray (VMess + WS on :8080) + decoy site (:8081)
+      - name: Run Xray (VMess + XHTTP on :8080) + decoy site (:8081)
         run: |
           nohup ./xray run -c xray_config.json > xray.log 2>&1 &
           nohup python3 -m http.server 8081 --directory decoy > decoy.log 2>&1 &
@@ -76,15 +76,55 @@ jobs:
           for i in $(seq 1 20); do grep -qiE "Registered tunnel connection" cf.log && break; sleep 2; done
           tail -12 cf.log || true
 
+      - name: End-to-end test through the edge (real XHTTP client)
+        run: |
+          cat > client_test.json <<'JSON'
+          {
+            "log": { "loglevel": "warning" },
+            "inbounds": [
+              { "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+                "settings": { "udp": false } }
+            ],
+            "outbounds": [
+              {
+                "protocol": "vmess",
+                "settings": {
+                  "vnext": [{
+                    "address": "1.tsoolgee.uk",
+                    "port": 443,
+                    "users": [{ "id": "b7d37230-8508-4f0d-bd14-21d09c93eb9f",
+                                "alterId": 0, "security": "auto" }]
+                  }]
+                },
+                "streamSettings": {
+                  "network": "xhttp",
+                  "security": "tls",
+                  "tlsSettings": { "serverName": "1.tsoolgee.uk" },
+                  "xhttpSettings": { "path": "/xh", "host": "1.tsoolgee.uk", "mode": "packet-up" }
+                }
+              }
+            ]
+          }
+          JSON
+          nohup ./xray run -c client_test.json > client.log 2>&1 &
+          sleep 4
+          IP=$(curl -s --max-time 25 --socks5-hostname 127.0.0.1:10808 https://ipinfo.io/ip || true)
+          if [ -n "$IP" ]; then echo "E2E=OK egress_ip=$IP"; else echo "E2E=FAIL"; tail -20 client.log; tail -20 xray.log; fi
+          pkill -f "client_test.json" || true
+
       - name: Self-check + diagnostics
         run: |
           {
             echo "=== TUNNEL_ID ==="; cat /home/runner/tunnel_id.txt
-            echo "=== local xray 8080/xh ==="; curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/xh
+            echo "=== local xray 8080/xh (bare GET, 404/400 is normal) ==="
+            curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/xh
             echo "=== local decoy 8081/ ==="; curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8081/
             for host in 1.tsoolgee.uk cdn.tsoolgee.uk; do
               echo "=== edge $host / (decoy) ==="; curl -s -o /dev/null -w "%{http_code}\n" https://$host/ || true
               echo "=== edge $host /xh (xray) ==="; curl -s -o /dev/null -w "%{http_code}\n" https://$host/xh || true
+              echo "=== edge $host /xh upgrade-free POST ==="
+              curl -s -o /dev/null -w "%{http_code} http_version=%{http_version}\n" \
+                   -X POST --data-binary "test" https://$host/xh/probe/0 || true
             done
             echo "=== cf registration ==="; grep -iE "Registered tunnel connection|error|unauthorized" cf.log | head -8
           } > diag.txt 2>&1
@@ -101,7 +141,7 @@ jobs:
         run: |
           for i in $(seq 1 340); do
             pgrep -f "cloudflared tunnel" >/dev/null || { echo cf-restart; nohup cloudflared tunnel --config cloudflared.yml run >> cf.log 2>&1 & }
-            pgrep -f "xray run" >/dev/null || { echo xray-restart; nohup ./xray run -c xray_config.json >> xray.log 2>&1 & }
+            pgrep -f "xray run -c xray_config.json" >/dev/null || { echo xray-restart; nohup ./xray run -c xray_config.json >> xray.log 2>&1 & }
             pgrep -f "http.server 8081" >/dev/null || { echo decoy-restart; nohup python3 -m http.server 8081 --directory decoy >> decoy.log 2>&1 & }
             sleep 60
           done

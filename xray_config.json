@@ -11,8 +11,14 @@
         ]
       },
       "streamSettings": {
-        "network": "ws",
-        "wsSettings": { "path": "/xh" },
+        "network": "xhttp",
+        "xhttpSettings": {
+          "path": "/xh",
+          "mode": "auto",
+          "scMaxEachPostBytes": 1000000,
+          "scMaxBufferedPosts": 30,
+          "xPaddingBytes": "100-1000"
+        },
         "sockopt": { "tcpNoDelay": true, "tcpFastOpen": true }
       }
     }

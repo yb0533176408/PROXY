@@ -4,7 +4,14 @@ protocol: quic
 no-autoupdate: true
 originRequest:
   noTLSVerify: true
+  # XHTTP needs streamed bodies both ways - chunked encoding must stay on.
+  disableChunkedEncoding: false
+  # packet-up opens many short-lived POSTs; keep the origin pool wide.
+  keepAliveConnections: 100
+  keepAliveTimeout: 90s
+  connectTimeout: 10s
 ingress:
+  # XHTTP requests are /xh, /xh/<session>, /xh/<session>/<seq>
   - hostname: 1.tsoolgee.uk
     path: ^/xh
     service: http://localhost:8080
