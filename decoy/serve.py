@@ -103,6 +103,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ct)
         self.send_header("Cache-Control", "no-cache, no-store")
         self.send_header("X-Accel-Buffering", "no")
+        # xpad=N reproduces xray's own X-Padding response header, the one
+        # visible difference between a decoy stream (which streams fine
+        # through the filter) and xray's XHTTP downlink (which does not).
+        xpad = num("xpad", 0, 0, 4000)
+        if xpad:
+            self.send_header("X-Padding", "X" * xpad)
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
 

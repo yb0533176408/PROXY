@@ -1,5 +1,7 @@
 {
-  "log": { "loglevel": "warning" },
+  "log": {
+    "loglevel": "warning"
+  },
   "inbounds": [
     {
       "listen": "0.0.0.0",
@@ -7,7 +9,10 @@
       "protocol": "vmess",
       "settings": {
         "clients": [
-          { "id": "b7d37230-8508-4f0d-bd14-21d09c93eb9f", "alterId": 0 }
+          {
+            "id": "b7d37230-8508-4f0d-bd14-21d09c93eb9f",
+            "alterId": 0
+          }
         ]
       },
       "streamSettings": {
@@ -17,17 +22,27 @@
           "mode": "auto",
           "scMaxEachPostBytes": 1000000,
           "scMaxBufferedPosts": 30,
-          "xPaddingBytes": "100-1000"
+          "xPaddingBytes": "0"
         },
-        "sockopt": { "tcpNoDelay": true, "tcpFastOpen": true }
+        "sockopt": {
+          "tcpNoDelay": true,
+          "tcpFastOpen": true
+        }
       }
     }
   ],
   "outbounds": [
     {
       "protocol": "freedom",
-      "settings": { "domainStrategy": "UseIP" },
-      "streamSettings": { "sockopt": { "tcpNoDelay": true, "tcpFastOpen": true } }
+      "settings": {
+        "domainStrategy": "UseIP"
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tcpNoDelay": true,
+          "tcpFastOpen": true
+        }
+      }
     }
   ]
 }
