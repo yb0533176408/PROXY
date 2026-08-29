@@ -1,0 +1,66 @@
+name: Raw-TCP survival probe (bore)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: tcp-probe
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download bore (raw-TCP tunnel)
+        run: |
+          curl -L -o bore.tgz https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz
+          tar xzf bore.tgz
+          chmod +x bore
+          ./bore --version
+
+      - name: Start probe server on :5432
+        run: |
+          nohup python3 probe/tcp_probe_server.py 5432 > srv.log 2>&1 &
+          sleep 2
+          ss -ltnp 2>/dev/null | grep ':5432' && echo "probe server up" || { echo "NOT up"; cat srv.log; exit 1; }
+
+      - name: Open bore tunnel + publish endpoint
+        run: |
+          nohup ./bore local 5432 --to bore.pub > bore.log 2>&1 &
+          # bore prints: "listening at bore.pub:XXXXX"
+          for i in $(seq 1 30); do
+            EP=$(grep -oE 'bore\.pub:[0-9]+' bore.log | head -1)
+            [ -n "$EP" ] && break
+            sleep 1
+          done
+          if [ -z "$EP" ]; then echo "no endpoint"; cat bore.log; exit 1; fi
+          echo "ENDPOINT=$EP"
+          echo "$EP" > endpoint.txt
+
+          # publish it on a side branch so my client can read it (a push to
+          # 'probe-status' does NOT trigger proxy.yml, which is main-only)
+          git config user.name  "probe-bot"
+          git config user.email "probe-bot@users.noreply.github.com"
+          git checkout --orphan probe-status
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          find . -maxdepth 1 -not -name '.' -not -name '.git' -not -name 'endpoint.txt' -exec rm -rf {} + 2>/dev/null || true
+          git add endpoint.txt
+          git commit -m "probe endpoint $EP" >/dev/null
+          git push -f origin probe-status
+          echo "published $EP to branch probe-status"
+
+      - name: Hold open ~10 min (serve probe connections)
+        run: |
+          for i in $(seq 1 60); do
+            pgrep -f "bore local"        >/dev/null || { echo "bore died"; nohup ./bore local 5432 --to bore.pub >> bore.log 2>&1 & }
+            pgrep -f "tcp_probe_server"  >/dev/null || { echo "server died"; nohup python3 probe/tcp_probe_server.py 5432 >> srv.log 2>&1 & }
+            sleep 10
+          done
+          echo "==== bore.log ===="; cat bore.log
+          echo "==== srv.log ===="; tail -80 srv.log
