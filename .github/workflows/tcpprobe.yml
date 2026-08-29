@@ -24,48 +24,37 @@ jobs:
           chmod +x bore
           ./bore --version
 
-      - name: Start probe server on :5432
+      - name: Start PostgreSQL-mimic server on :5432
         run: |
-          nohup python3 probe/tcp_probe_server.py 5432 > srv.log 2>&1 &
+          nohup python3 probe/pg_probe_server.py 5432 > srv.log 2>&1 &
           sleep 2
-          ss -ltnp 2>/dev/null | grep ':5432' && echo "probe server up" || { echo "NOT up"; cat srv.log; exit 1; }
+          ss -ltnp 2>/dev/null | grep ':5432' && echo "pg-mimic up" || { echo "NOT up"; cat srv.log; exit 1; }
 
-      - name: Open bore tunnels on STANDARD ports (5432/3306/9418)
+      - name: Open bore tunnel on :5432
         run: |
-          : > /tmp/eps.txt
-          for want in 5432 3306 9418 993 8333; do
-            nohup ./bore local 5432 --to bore.pub --port $want > bore-$want.log 2>&1 &
-            sleep 4
-            GOT=$(grep -oE 'bore\.pub:[0-9]+' bore-$want.log | head -1)
-            if [ -n "$GOT" ]; then
-              echo "requested $want -> got $GOT"
-              echo "$want $GOT" >> /tmp/eps.txt
-            else
-              echo "requested $want -> DENIED:"; tail -2 bore-$want.log
-            fi
-          done
-          echo "=== granted endpoints ==="; cat /tmp/eps.txt
+          nohup ./bore local 5432 --to bore.pub --port 5432 > bore.log 2>&1 &
+          sleep 5
+          GOT=$(grep -oE 'bore\.pub:[0-9]+' bore.log | head -1)
+          if [ -z "$GOT" ]; then echo "no endpoint"; cat bore.log; exit 1; fi
+          echo "ENDPOINT=$GOT"; echo "$GOT" > /tmp/ep.txt
 
-      - name: Publish granted endpoints to probe-status branch
+      - name: Publish endpoint
         run: |
-          cp /tmp/eps.txt eps.txt
+          cp /tmp/ep.txt ep.txt
           git config user.name  "probe-bot"
           git config user.email "probe-bot@users.noreply.github.com"
           git checkout --orphan probe-status
           git reset >/dev/null 2>&1 || true
-          git add -f eps.txt
-          git commit -m "granted endpoints" >/dev/null
+          git add -f ep.txt
+          git commit -m "pg endpoint" >/dev/null
           git push -f origin probe-status
-          echo "published:"; cat eps.txt
+          echo "published $(cat ep.txt)"
 
       - name: Hold open ~6 min
         run: |
           for i in $(seq 1 36); do
-            for want in 5432 3306 9418 993 8333; do
-              pgrep -f "bore local 5432 --to bore.pub --port $want" >/dev/null || \
-                nohup ./bore local 5432 --to bore.pub --port $want >> bore-$want.log 2>&1 &
-            done
-            pgrep -f tcp_probe_server >/dev/null || nohup python3 probe/tcp_probe_server.py 5432 >> srv.log 2>&1 &
+            pgrep -f "bore local 5432" >/dev/null || nohup ./bore local 5432 --to bore.pub --port 5432 >> bore.log 2>&1 &
+            pgrep -f pg_probe_server >/dev/null || nohup python3 probe/pg_probe_server.py 5432 >> srv.log 2>&1 &
             sleep 10
           done
-          echo "==== server log tail ===="; tail -60 srv.log
+          echo "==== server log tail ===="; tail -80 srv.log
