@@ -55,6 +55,44 @@ jobs:
           git push -f origin probe-status
           echo "published $EP to branch probe-status"
 
+      - name: Clean-network self-test (server alone, then via bore)
+        run: |
+          EP=$(grep -oE 'bore\.pub:[0-9]+' bore.log | head -1)
+          python3 - "$EP" <<'PY'
+          import socket, sys, time
+          ep = sys.argv[1]; bhost, bport = ep.rsplit(":", 1); bport = int(bport)
+
+          def listen(host, port, label, secs):
+              t0 = time.time()
+              try:
+                  s = socket.create_connection((host, port), timeout=10)
+              except OSError as e:
+                  print("%s CONNECT-FAIL %s" % (label, e)); return
+              s.settimeout(3)
+              hb = 0; first = None; resumed = False
+              while time.time() - t0 < secs:
+                  try:
+                      d = s.recv(4096)
+                  except socket.timeout:
+                      continue
+                  except OSError as e:
+                      print("%s recv err %s at %.1fs" % (label, e, time.time()-t0)); break
+                  if not d:
+                      print("%s closed at %.1fs (hb=%d)" % (label, time.time()-t0, hb)); s.close(); return
+                  if first is None: first = time.time()-t0
+                  for t in d.split(b"\n"):
+                      if t.startswith(b"HB "):
+                          hb += 1
+                          if time.time()-t0 > 36: resumed = True
+              print("%s ALIVE %.0fs first=%.2f hb=%d survived_idle=%s" %
+                    (label, secs, first or -1, hb, resumed))
+              s.close()
+
+          print("=== clean-network baseline ===", flush=True)
+          listen("127.0.0.1", 5432, "[local server ]", 8)
+          listen(bhost, bport,      "[via bore.pub ]", 45)
+          PY
+
       - name: Hold open ~10 min (serve probe connections)
         run: |
           for i in $(seq 1 60); do
