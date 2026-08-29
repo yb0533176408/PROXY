@@ -17,44 +17,49 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Download bore (raw-TCP tunnel)
+      - name: Download bore
         run: |
           curl -L -o bore.tgz https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz
-          tar xzf bore.tgz
-          chmod +x bore
-          ./bore --version
+          tar xzf bore.tgz && chmod +x bore && ./bore --version
 
-      - name: Start PostgreSQL-mimic server on :5432
+      - name: Start SMTP-mimic server on :2525
         run: |
-          nohup python3 probe/pg_probe_server.py 5432 > srv.log 2>&1 &
+          nohup python3 probe/smtp_probe_server.py 2525 > srv.log 2>&1 &
           sleep 2
-          ss -ltnp 2>/dev/null | grep ':5432' && echo "pg-mimic up" || { echo "NOT up"; cat srv.log; exit 1; }
+          ss -ltnp 2>/dev/null | grep ':2525' && echo "smtp-mimic up" || { cat srv.log; exit 1; }
 
-      - name: Open bore tunnel on :5432
+      - name: Open bore tunnels (SMTP ports + a high port)
         run: |
-          nohup ./bore local 5432 --to bore.pub --port 5432 > bore.log 2>&1 &
-          sleep 5
-          GOT=$(grep -oE 'bore\.pub:[0-9]+' bore.log | head -1)
-          if [ -z "$GOT" ]; then echo "no endpoint"; cat bore.log; exit 1; fi
-          echo "ENDPOINT=$GOT"; echo "$GOT" > /tmp/ep.txt
+          : > /tmp/eps.txt
+          for want in 587 25 465 2525 0; do
+            nohup ./bore local 2525 --to bore.pub --port $want > bore-$want.log 2>&1 &
+            sleep 4
+            GOT=$(grep -oE 'bore\.pub:[0-9]+' bore-$want.log | head -1)
+            if [ -n "$GOT" ]; then echo "req $want -> $GOT"; echo "$want $GOT" >> /tmp/eps.txt
+            else echo "req $want -> DENIED:"; tail -1 bore-$want.log; fi
+          done
+          echo "=== granted ==="; cat /tmp/eps.txt
 
-      - name: Publish endpoint
+      - name: Publish endpoints
         run: |
-          cp /tmp/ep.txt ep.txt
-          git config user.name  "probe-bot"
-          git config user.email "probe-bot@users.noreply.github.com"
+          cp /tmp/eps.txt eps.txt
+          git config user.name probe-bot
+          git config user.email probe-bot@users.noreply.github.com
           git checkout --orphan probe-status
           git reset >/dev/null 2>&1 || true
-          git add -f ep.txt
-          git commit -m "pg endpoint" >/dev/null
+          git add -f eps.txt
+          git commit -m "smtp endpoints" >/dev/null
           git push -f origin probe-status
-          echo "published $(cat ep.txt)"
+          echo published; cat eps.txt
 
       - name: Hold open ~6 min
         run: |
           for i in $(seq 1 36); do
-            pgrep -f "bore local 5432" >/dev/null || nohup ./bore local 5432 --to bore.pub --port 5432 >> bore.log 2>&1 &
-            pgrep -f pg_probe_server >/dev/null || nohup python3 probe/pg_probe_server.py 5432 >> srv.log 2>&1 &
+            for want in 587 25 465 2525 0; do
+              pgrep -f "bore local 2525 --to bore.pub --port $want" >/dev/null || \
+                nohup ./bore local 2525 --to bore.pub --port $want >> bore-$want.log 2>&1 &
+            done
+            pgrep -f smtp_probe_server >/dev/null || nohup python3 probe/smtp_probe_server.py 2525 >> srv.log 2>&1 &
             sleep 10
           done
-          echo "==== server log tail ===="; tail -80 srv.log
+          echo "==== srv.log tail ===="; tail -80 srv.log
