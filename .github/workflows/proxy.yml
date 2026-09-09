@@ -1,4 +1,4 @@
-name: HTTP Proxy via Cloudflare Tunnel
+name: HTTP Proxy via Quick Cloudflare Tunnel
 
 on:
   workflow_dispatch:
@@ -23,8 +23,6 @@ jobs:
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
           sudo sysctl -w net.core.rmem_max=268435456
           sudo sysctl -w net.core.wmem_max=268435456
-          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 268435456"
-          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 268435456"
 
       - name: Download Xray-core
         run: |
@@ -32,15 +30,15 @@ jobs:
           unzip -o xray.zip xray 2>/dev/null || unzip -o xray.zip
           chmod +x xray
 
-      - name: Create Xray HTTP Proxy Config
+      - name: Create Xray HTTP Proxy Config (Port 1234)
         run: |
-          cat > xray_http_config.json <<'JSON'
+          cat > xray_config.json <<'JSON'
           {
             "log": { "loglevel": "warning" },
             "inbounds": [
               {
                 "listen": "127.0.0.1",
-                "port": 8080,
+                "port": 1234,
                 "protocol": "http",
                 "settings": {
                   "allowTransparent": false
@@ -58,43 +56,47 @@ jobs:
 
       - name: Run HTTP Proxy Server
         run: |
-          nohup ./xray run -c xray_http_config.json > xray.log 2>&1 &
+          nohup ./xray run -c xray_config.json > xray.log 2>&1 &
           sleep 3
-          ss -ltnp | grep ':8080' && echo "HTTP Proxy running on port 8080" || { cat xray.log; exit 1; }
+          ss -ltnp | grep ':1234' && echo "HTTP Proxy running on port 1234" || { cat xray.log; exit 1; }
 
       - name: Install cloudflared
         run: |
           curl -L -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
 
-      - name: Build tunnel credentials
-        env:
-          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+      - name: Run Quick Cloudflare Tunnel
         run: |
-          TID=$(python3 - <<'PY'
-          import os, base64, json
-          t = os.environ['CF_TUNNEL_TOKEN'].strip()
-          d = json.loads(base64.b64decode(t + '=='*(-len(t) % 4)))
-          json.dump({"AccountTag": d["a"], "TunnelID": d["t"],
-                     "TunnelSecret": d["s"], "Endpoint": ""},
-                    open("/home/runner/creds.json", "w"))
-          print(d["t"])
-          PY
-          )
-          echo "Tunnel ID: $TID"
+          # הרצת המנהרה הזמנית שמפנה לפורט 1234 המקומי
+          nohup cloudflared tunnel --url http://127.0.0.1:1234 > cf.log 2>&1 &
+          
+          # חילוץ הקישור האקראי מתוך הלוג
+          for i in $(seq 1 20); do
+            TUNNEL_URL=$(grep -oE 'https://[-a-zA-Z0-9 complexity.]+\.trycloudflare\.com' cf.log | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+            sleep 2
+          done
 
-      - name: Run Cloudflare Tunnel
-        env:
-          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
-        run: |
-          nohup cloudflared tunnel run --token $CF_TUNNEL_TOKEN > cf.log 2>&1 &
-          sleep 5
-          grep -iE "Registered tunnel connection" cf.log || head -15 cf.log
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Failed to obtain Quick Tunnel URL"
+            cat cf.log
+            exit 1
+          fi
+
+          echo "=========================================="
+          echo "YOUR RANDOM PROXY URL: $TUNNEL_URL"
+          echo "=========================================="
+          
+          # שמירת שם המארח בלבד (ללא https://)
+          HOST=$(echo "$TUNNEL_URL" | sed -e 's|^https://||')
+          echo "$HOST" > /home/runner/tunnel_host.txt
 
       - name: Keep alive (~5h40m)
         run: |
           for i in $(seq 1 340); do
-            pgrep -f "cloudflared" >/dev/null || nohup cloudflared tunnel run --token ${{ secrets.CF_TUNNEL_TOKEN }} >> cf.log 2>&1 &
-            pgrep -f "xray" >/dev/null || nohup ./xray run -c xray_http_config.json >> xray.log 2>&1 &
+            pgrep -f "cloudflared" >/dev/null || nohup cloudflared tunnel --url http://127.0.0.1:1234 >> cf.log 2>&1 &
+            pgrep -f "xray" >/dev/null || nohup ./xray run -c xray_config.json >> xray.log 2>&1 &
             sleep 60
           done
