@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""SMTP-framed proxy client.
+
+Listens locally as an HTTP and SOCKS5 proxy for the browser, and carries
+every connection to the GitHub-Actions server over a connection that
+opens as an ordinary ESMTP session (so a DPI filter lets it through) and
+then becomes an encrypted tunnel.
+
+  HTTP   127.0.0.1:10809   <- point the browser / ZeroOmega here
+  SOCKS5 127.0.0.1:10808
+
+Startup reads the live server endpoint from the public 'live' branch (no
+token needed) and connects straight away. The server is always running,
+so this client never starts a run or checks run status. Many machines
+can run this at once against the same run.
+
+Honest security note: the tunnel secret is symmetric and baked into this
+client, so it protects against the filter and casual abuse, not against
+someone who has the client. Real browsing is HTTPS end to end.
+"""
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import socket
+import ssl
+import struct
+import sys
+import threading
+import time
+import urllib.request
+
+# ------------------------------------------------------------- configuration
+OWNER = "yb0533176408"
+REPO = "PROXY"
+
+# The workflow pins bore to this port (bore local ... --port 24601), so the
+# endpoint is almost always this. Used as a last-resort default when GitHub
+# can't be reached (e.g. during a DNS/connectivity blip) so the client can
+# still connect straight to the already-running server instead of hanging.
+DEFAULT_ENDPOINT = "bore.pub:24833"
+
+# Shared tunnel secret - MUST match the repo secret PROXY_SECRET. Injected
+# at build time; the placeholder is replaced by build_exe. Never commit a
+# real value to the public repo.
+SECRET = b"__PROXY_SECRET_PLACEHOLDER__"
+
+HTTP_PORT = 10809
+SOCKS_PORT = 10808
+AUTH_WINDOW = 300
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+# Where we remember the last good endpoint + resolved IP, so a fresh start
+# during a blip doesn't need GitHub or DNS at all.
+_FROZEN = getattr(sys, "frozen", False)
+_HERE = os.path.dirname(sys.executable if _FROZEN else os.path.abspath(__file__))
+CACHE_PATH = os.path.join(_HERE, "proxy_cache.json")
+
+
+def say(m=""):
+    try:
+        print(m, flush=True)
+    except UnicodeEncodeError:
+        print(m.encode("ascii", "replace").decode("ascii"), flush=True)
+
+
+# ------------------------------------------------------------- crypto / io
+class Stream:
+    # big-int XOR keystream - ~10x faster than a per-byte loop, same bytes
+    def __init__(self, key):
+        self.key = key; self.ctr = 0; self.buf = b""
+
+    def xor(self, data):
+        n = len(data)
+        if not n:
+            return b""
+        while len(self.buf) < n:
+            self.buf += hashlib.sha256(self.key + struct.pack(">Q", self.ctr)).digest()
+            self.ctr += 1
+        ks = self.buf[:n]; self.buf = self.buf[n:]
+        return (int.from_bytes(data, "big") ^ int.from_bytes(ks, "big")).to_bytes(n, "big")
+
+
+class BufReader:
+    def __init__(self, sock):
+        self.s = sock; self.buf = b""
+
+    def _fill(self):
+        d = self.s.recv(65536)
+        if not d:
+            raise ConnectionError("peer closed")   # OSError subclass: caught everywhere
+        self.buf += d
+
+    def readline(self, limit=8192):
+        while b"\n" not in self.buf:
+            if len(self.buf) > limit:
+                break
+            self._fill()
+        i = self.buf.find(b"\n")
+        if i < 0:
+            line, self.buf = self.buf, b""
+            return line
+        line, self.buf = self.buf[:i + 1], self.buf[i + 1:]
+        return line
+
+    def read_exact(self, n):
+        while len(self.buf) < n:
+            self._fill()
+        d, self.buf = self.buf[:n], self.buf[n:]
+        return d
+
+    def take(self):
+        d, self.buf = self.buf, b""
+        return d
+
+
+def derive(ns, nc, tag):
+    return hashlib.sha256(SECRET + tag + ns + nc).digest()
+
+
+def auth_token():
+    b = int(time.time() // AUTH_WINDOW)
+    return hmac.new(SECRET, b"auth" + str(b).encode(), hashlib.sha256).hexdigest()
+
+
+def pump(src, dst, cipher, initial=b""):
+    try:
+        if initial:
+            dst.sendall(initial)
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(cipher.xor(data))
+    except OSError:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------- github discovery
+def tls_context():
+    """Verifying TLS context that also trusts the OS certificate store.
+
+    This network intercepts TLS and re-signs it with a filter CA that
+    lives in the Windows root store. Python's default context does not
+    load that store, so api.github.com fails to verify - load it by hand.
+    """
+    ctx = ssl.create_default_context()
+    try:
+        ctx.load_default_certs(ssl.Purpose.SERVER_AUTH)
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            for cert, enc, trust in ssl.enum_certificates("ROOT"):
+                if enc == "x509_asn" and (trust is True or (
+                        isinstance(trust, set) and ssl.Purpose.SERVER_AUTH.oid in trust)):
+                    try:
+                        ctx.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(cert))
+                    except ssl.SSLError:
+                        pass
+        except Exception:
+            pass
+    return ctx
+
+
+def _get(url, token=None, timeout=15):
+    h = {"User-Agent": "tsoolgee-proxy", "Accept": "application/vnd.github+json"}
+    if token:
+        h["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout, context=tls_context()) as r:
+        return r.status, r.read()
+
+
+def live_endpoint():
+    """Read the endpoint from raw.githubusercontent - a CDN with no API
+    rate limit, so every machine (all sharing one IP behind the filter)
+    can poll it freely. The endpoint is pinned, so ~5 min CDN caching is
+    fine. Falls back to the API only if the CDN read fails."""
+    raw_url = "https://raw.githubusercontent.com/%s/%s/live/endpoint.json" % (OWNER, REPO)
+    try:
+        _, raw = _get(raw_url)
+        return json.loads(raw).get("endpoint")
+    except Exception:
+        pass
+    try:
+        api = "https://api.github.com/repos/%s/%s/contents/endpoint.json?ref=live" % (OWNER, REPO)
+        _, raw = _get(api)
+        data = base64.b64decode(json.loads(raw)["content"])
+        return json.loads(data).get("endpoint")
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------- tunnel
+STATE = {"endpoint": None, "fails": 0, "lock": threading.Lock(),
+         "dns_host": None, "dns_addrs": []}
+
+
+def load_cache():
+    """Load the last good endpoint + resolved IP from disk, so a cold start
+    during a blip can connect without touching GitHub or DNS."""
+    try:
+        with open(CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    restored = []
+    for item in data.get("dns_addrs") or []:
+        try:
+            fam, sa = item
+            restored.append((int(fam), tuple(sa)))
+        except (ValueError, TypeError):
+            pass
+    with STATE["lock"]:
+        if data.get("endpoint") and not STATE["endpoint"]:
+            STATE["endpoint"] = data["endpoint"]
+        if data.get("dns_host") and restored:
+            STATE["dns_host"] = data["dns_host"]
+            STATE["dns_addrs"] = restored
+
+
+def save_cache():
+    """Best-effort persist of endpoint + resolved IP (atomic replace)."""
+    with STATE["lock"]:
+        data = {"endpoint": STATE["endpoint"], "dns_host": STATE["dns_host"],
+                "dns_addrs": [[fam, list(sa)] for fam, sa in STATE["dns_addrs"]]}
+    try:
+        tmp = CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, CACHE_PATH)
+    except OSError:
+        pass
+
+
+def _connect_pinned(bhost, bport):
+    """Connect to bhost:bport, but remember the last IP that resolved while
+    the network was healthy and reuse it when DNS is down.
+
+    Some connectivity drops only break the DNS resolver: already-open
+    sockets keep working, but a NEW connection can't translate the name.
+    MicroSIP survives those because it dials a fixed server IP. We do the
+    same - resolve once when we can, cache it (to disk too), and on a later
+    DNS failure fall back to the cached IP so a fresh tunnel still opens."""
+    addrs = []
+    fresh = False
+    try:
+        for fam, _, _, _, sa in socket.getaddrinfo(bhost, bport, type=socket.SOCK_STREAM):
+            addrs.append((fam, sa))
+        if addrs:                              # fresh resolve worked - cache it
+            fresh = True
+            with STATE["lock"]:
+                STATE["dns_host"] = bhost
+                STATE["dns_addrs"] = addrs
+    except socket.gaierror:
+        with STATE["lock"]:                    # DNS down - use the last good IP
+            if STATE["dns_host"] == bhost:
+                addrs = list(STATE["dns_addrs"])
+        if addrs:
+            say("[*] DNS lookup failed - connecting by cached IP (%s)" % addrs[0][1][0])
+    if not addrs:
+        raise OSError("cannot resolve %s (no cached IP yet)" % bhost)
+    if fresh:
+        save_cache()
+    last = None
+    for fam, sa in addrs:
+        try:
+            s = socket.socket(fam, socket.SOCK_STREAM)
+            s.settimeout(15)
+            s.connect(sa)
+            return s
+        except OSError as e:
+            last = e
+            try:
+                s.close()
+            except OSError:
+                pass
+    raise last or OSError("connect failed to %s" % bhost)
+
+
+def open_tunnel(endpoint, host, port):
+    """Open one SMTP-framed encrypted tunnel to host:port. Returns
+    (sock, enc, dec, leftover) where leftover is plaintext already read
+    past the server's OK line (usually empty)."""
+    bhost, bport = endpoint.rsplit(":", 1)
+    s = _connect_pinned(bhost, int(bport))
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s.settimeout(20)
+    r = BufReader(s)
+    try:
+        if not r.readline().startswith(b"220"):
+            raise OSError("no SMTP banner")
+        s.sendall(b"EHLO tsoolgee\r\n")
+        while True:
+            line = r.readline()
+            if not line:
+                raise OSError("EHLO failed")
+            if line[3:4] == b" " or line[3:4] == b"":
+                break
+        s.sendall(b"AUTH PLAIN %s\r\n" % auth_token().encode())
+        if not r.readline().startswith(b"235"):
+            raise OSError("auth rejected")
+        # key exchange - all through the same reader
+        nonce_s = r.read_exact(16)
+        nonce_c = os.urandom(16)
+        s.sendall(nonce_c)
+        enc = Stream(derive(nonce_s, nonce_c, b"C2S"))
+        dec = Stream(derive(nonce_s, nonce_c, b"S2C"))
+        s.sendall(enc.xor(b"CONNECT %s:%d\n" % (host.encode(), port)))
+        acc = dec.xor(r.take())
+        while b"\n" not in acc and len(acc) < 256:
+            chunk = s.recv(128)
+            if not chunk:
+                raise OSError("no CONNECT reply")
+            acc += dec.xor(chunk)
+        head, _, leftover = acc.partition(b"\n")
+        if not head.startswith(b"OK"):
+            raise OSError("server: %s" % head.decode("ascii", "ignore"))
+        s.settimeout(None)
+        return s, enc, dec, leftover
+    except Exception:
+        try:
+            s.close()
+        except OSError:
+            pass
+        raise
+
+
+# ------------------------------------------------------------- local fronts
+def serve_http(browser):
+    r = BufReader(browser)
+    first = r.readline()
+    if not first:
+        browser.close(); return
+    try:
+        method, target, _ = first.decode("latin-1").split(" ", 2)
+    except ValueError:
+        browser.close(); return
+    headers = []
+    while True:
+        h = r.readline()
+        if h in (b"\r\n", b"\n", b""):
+            break
+        headers.append(h)
+
+    if method.upper() == "CONNECT":
+        host, port = _split_hostport(target, 443)
+        ok = _bridge(browser, host, port, preface=r.take(), connect=True)
+    else:
+        try:
+            rest = target.split("://", 1)[1]
+            hostport, _, path = rest.partition("/")
+            host, port = _split_hostport(hostport, 80)
+        except Exception:
+            browser.close(); return
+        req = ("%s /%s HTTP/1.1\r\n" % (method, path)).encode() + b"".join(headers) + b"\r\n"
+        # r.take() = any request body already buffered (POST/PUT)
+        ok = _bridge(browser, host, port, preface=req + r.take(), connect=False)
+    if not ok:
+        try:
+            browser.sendall(b"HTTP/1.1 502 Bad Gateway\r\n"
+                            b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+        except OSError:
+            pass
+        browser.close()
+
+
+def _split_hostport(hostport, default_port):
+    if hostport.startswith("["):
+        h, _, rest = hostport[1:].partition("]")
+        p = rest.lstrip(":")
+        return h, int(p) if p else default_port
+    if ":" in hostport:
+        h, _, p = hostport.rpartition(":")
+        return h, int(p) if p else default_port
+    return hostport, default_port
+
+
+def serve_socks(browser):
+    r = BufReader(browser)
+    head = r.read_exact(2)
+    if head[0] != 5:
+        browser.close(); return
+    r.read_exact(head[1])                       # methods
+    browser.sendall(b"\x05\x00")
+    req = r.read_exact(4)
+    if req[1] != 1:                             # CONNECT only
+        browser.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00"); browser.close(); return
+    atyp = req[3]
+    if atyp == 1:
+        host = socket.inet_ntoa(r.read_exact(4))
+    elif atyp == 3:
+        host = r.read_exact(r.read_exact(1)[0]).decode("latin-1")
+    elif atyp == 4:
+        host = socket.inet_ntop(socket.AF_INET6, r.read_exact(16))
+    else:
+        browser.close(); return
+    port = struct.unpack("!H", r.read_exact(2))[0]
+    if not _bridge(browser, host, port, preface=r.take(), connect=False, socks_reply=True):
+        try:
+            browser.sendall(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+        except OSError:
+            pass
+        browser.close()
+
+
+def _open_retry(host, port, tries=6):
+    """Open a tunnel, riding over brief network drops. The bore free relay
+    sometimes drops a handshake and a flaky link blinks out for a second; a
+    few retries with capped exponential backoff - plus an endpoint refresh
+    partway, in case bore reconnected on a new port - keep a request (and a
+    page's many parallel connections) from failing on a momentary blip."""
+    last = None
+    for i in range(tries):
+        ep = STATE["endpoint"]
+        if not ep:
+            _refresh_endpoint()               # lost it? try to get it back
+            ep = STATE["endpoint"]
+            if not ep:
+                time.sleep(min(0.3 * (2 ** i), 3.0))
+                continue
+        try:
+            t = open_tunnel(ep, host, port)
+            with STATE["lock"]:
+                STATE["fails"] = 0             # healthy again
+            return t
+        except OSError as e:
+            last = e
+            _note_fail()
+            if i == 2:                         # halfway: maybe the port moved
+                _refresh_endpoint()
+            time.sleep(min(0.3 * (2 ** i), 3.0))
+    if last:
+        raise last
+    raise OSError("no endpoint")
+
+
+def _bridge(browser, host, port, preface, connect, socks_reply=False):
+    # On an open failure return False WITHOUT closing the browser, so the
+    # caller can send a proper error reply (502 / SOCKS error) first.
+    if not STATE["endpoint"]:
+        return False
+    try:
+        tunnel, enc, dec, leftover = _open_retry(host, port)
+    except OSError:
+        return False
+    try:
+        if connect:
+            browser.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        if socks_reply:
+            browser.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        if leftover:
+            browser.sendall(leftover)
+        # relay: browser<->tunnel, blocking, one thread per direction.
+        # `preface` is plaintext from the browser side, so it must be
+        # encrypted before it goes into the tunnel (pump sends initial raw).
+        t = threading.Thread(target=pump, args=(browser, tunnel, enc, enc.xor(preface)), daemon=True)
+        t.start()
+        pump(tunnel, browser, dec)
+        t.join(timeout=5)
+    finally:
+        for s in (browser, tunnel):
+            try:
+                s.close()
+            except OSError:
+                pass
+    return True
+
+
+def _refresh_endpoint():
+    """Fetch the current endpoint from GitHub (a cheap CDN read) and adopt it
+    if it moved. Safe to call often; does its network I/O without the lock."""
+    new = live_endpoint()
+    if not new:
+        return
+    with STATE["lock"]:
+        changed = new != STATE["endpoint"]
+        if changed:
+            STATE["endpoint"] = new
+    if changed:
+        say("[*] Endpoint changed -> %s" % new)
+        save_cache()
+
+
+def _note_fail():
+    with STATE["lock"]:
+        STATE["fails"] += 1
+        do = STATE["fails"] >= 3              # endpoint may have moved
+        if do:
+            STATE["fails"] = 0
+    if do:
+        _refresh_endpoint()
+
+
+def _endpoint_watchdog():
+    """Proactively keep the endpoint fresh so a bore port change is absorbed
+    before it ever surfaces as a failed request."""
+    while True:
+        time.sleep(150)
+        try:
+            _refresh_endpoint()
+        except Exception:
+            pass
+
+
+def listener(port, handler):
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(128)
+    while True:
+        conn, _ = srv.accept()
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        threading.Thread(target=_guard, args=(handler, conn), daemon=True).start()
+
+
+def _guard(handler, conn):
+    try:
+        handler(conn)
+    except Exception:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------- main
+def main():
+    say("=" * 58)
+    say(" Tsoolgee proxy  -  ESMTP-framed tunnel")
+    say("=" * 58)
+    if SECRET.startswith(b"__PROXY_SECRET"):
+        say("[!] This build has no secret baked in. Rebuild with build_exe.py.")
+
+    # The server always runs (a scheduled/queued GitHub Actions run is kept
+    # live around the clock), so we never dispatch a run or check run status.
+    # Startup must survive a connectivity blip too: remember the last good
+    # endpoint on disk, try ONE quick refresh from GitHub, and otherwise fall
+    # back to the pinned default - never hang in a fetch loop, so we can
+    # connect straight to the server that is already up.
+    load_cache()
+    fresh = live_endpoint()
+    if fresh:
+        STATE["endpoint"] = fresh
+        save_cache()
+    elif STATE["endpoint"]:
+        say("[*] GitHub unreachable - using last known endpoint %s"
+            % STATE["endpoint"])
+    else:
+        STATE["endpoint"] = DEFAULT_ENDPOINT
+        say("[*] GitHub unreachable and no cache - using default %s"
+            % DEFAULT_ENDPOINT)
+    say("[+] Server endpoint: %s" % STATE["endpoint"])
+
+    ip = _selftest()
+    if ip:
+        say("[+] Verified: traffic exits from %s" % ip)
+    else:
+        say("[!] Could not confirm traffic yet - starting anyway; it will")
+        say("    connect as soon as the server is reachable.")
+
+    say("-" * 58)
+    say(" HTTP   127.0.0.1:%d   <- point the browser here" % HTTP_PORT)
+    say(" SOCKS5 127.0.0.1:%d" % SOCKS_PORT)
+    say(" Ctrl+C to stop.")
+    say("-" * 58)
+
+    threading.Thread(target=_endpoint_watchdog, daemon=True).start()
+    threading.Thread(target=listener, args=(HTTP_PORT, serve_http), daemon=True).start()
+    threading.Thread(target=listener, args=(SOCKS_PORT, serve_socks), daemon=True).start()
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        say("\n[*] Stopped.")
+    return 0
+
+
+def _selftest():
+    """Fetch our public IP over plain HTTP through the tunnel (no TLS in
+    the client on purpose - the browser terminates real HTTPS end to end)."""
+    for host, path in (("api.ipify.org", "/"), ("ifconfig.me", "/ip")):
+        try:
+            t, enc, dec, leftover = open_tunnel(STATE["endpoint"], host, 80)
+        except OSError:
+            continue
+        try:
+            req = ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: curl/8\r\n"
+                   "Connection: close\r\n\r\n" % (path, host)).encode()
+            t.sendall(enc.xor(req))
+            t.settimeout(20)
+            data = leftover
+            while len(data) < 8192:
+                chunk = t.recv(4096)
+                if not chunk:
+                    break
+                data += dec.xor(chunk)
+            body = data.split(b"\r\n\r\n", 1)[-1].strip()
+            ip = body.decode("ascii", "ignore").splitlines()[-1] if body else ""
+            if ip and ip.count(".") == 3 and len(ip) <= 15:
+                return ip
+        except Exception:
+            pass
+        finally:
+            try:
+                t.close()
+            except OSError:
+                pass
+    return None
+
+
+def _pause():
+    try:
+        input("Press Enter to exit ...")
+    except (EOFError, OSError):
+        pass
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as e:
+        # never vanish with a traceback on a double-clicked exe
+        say("")
+        say("[!] Unexpected error: %s: %s" % (type(e).__name__, e))
+        _pause()
+        sys.exit(1)

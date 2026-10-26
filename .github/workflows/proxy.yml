@@ -1,149 +1,121 @@
-name: VMess+XHTTP proxy via Cloudflare Tunnel
+name: SMTP-framed proxy
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
+  schedule:
+    # every 5 hours - keeps a run almost always live (a job lasts up to 6h)
+    - cron: "0 */5 * * *"
 
 concurrency:
   group: proxy-server
-  cancel-in-progress: true
+  # false, so a new run QUEUES behind the running server instead of
+  # killing it. The old run keeps serving until it ends (~5h50m), then
+  # the queued run takes over - near-continuous, no restart gaps.
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 jobs:
-  run-server:
+  run:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Tune kernel for high-RTT throughput (BBR + big buffers)
+      - name: Tune kernel (BBR + big buffers)
         run: |
-          sudo sysctl -w net.core.default_qdisc=fq
-          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
-          sudo sysctl -w net.core.rmem_max=268435456
-          sudo sysctl -w net.core.wmem_max=268435456
-          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 268435456"
-          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 268435456"
-          sudo sysctl -w net.ipv4.tcp_fastopen=3
-          sudo sysctl -w net.ipv4.tcp_mtu_probing=1
-          echo "cc=$(sysctl -n net.ipv4.tcp_congestion_control)"
+          sudo sysctl -w net.core.default_qdisc=fq || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
+          sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
 
-      - name: Download Xray-core
+      - name: Download bore
         run: |
-          curl -L -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-          unzip -o xray.zip xray 2>/dev/null || unzip -o xray.zip
-          chmod +x xray
-          ./xray version | head -2
+          curl -L -o bore.tgz https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz
+          tar xzf bore.tgz && chmod +x bore && ./bore --version
 
-      - name: Run Xray (VMess + XHTTP on :8080) + decoy site (:8081)
-        run: |
-          nohup ./xray run -c xray_config.json > xray.log 2>&1 &
-          nohup python3 decoy/serve.py 8081 > decoy.log 2>&1 &
-          sleep 4
-          ss -ltnp 2>/dev/null | grep ':8080' && echo "xray OK" || { echo "xray NOT up:"; cat xray.log; exit 1; }
-          ss -ltnp 2>/dev/null | grep ':8081' && echo "decoy OK" || { echo "decoy NOT up:"; cat decoy.log; }
-          curl -s -o /dev/null -w "decoy local / -> %{http_code}\n" http://127.0.0.1:8081/
-
-      - name: Install cloudflared
-        run: |
-          curl -L -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
-          cloudflared --version
-
-      - name: Build tunnel credentials + inject tunnel id
+      - name: Start tunnel server on :2525
         env:
-          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          # PROXY_SECRETS: one block per user (SECRET-NAME=... then domains).
+          # PROXY_SECRET: legacy single allow-all secret, used only if
+          # PROXY_SECRETS is unset. Set either one as a repo secret.
+          PROXY_SECRET: ${{ secrets.PROXY_SECRET }}
+          PROXY_SECRETS: ${{ secrets.PROXY_SECRETS }}
         run: |
-          TID=$(python3 - <<'PY'
-          import os, base64, json
-          t = os.environ['CF_TUNNEL_TOKEN'].strip()
-          d = json.loads(base64.b64decode(t + '=='*(-len(t) % 4)))
-          json.dump({"AccountTag": d["a"], "TunnelID": d["t"],
-                     "TunnelSecret": d["s"], "Endpoint": ""},
-                    open("/home/runner/creds.json", "w"))
-          print(d["t"])
-          PY
-          )
-          echo "tunnel id: $TID"
-          sed -i "s/__TUNNEL_ID__/$TID/" cloudflared.yml
-          echo "$TID" > /home/runner/tunnel_id.txt
-          cat cloudflared.yml
+          nohup env PROXY_SECRET="$PROXY_SECRET" PROXY_SECRETS="$PROXY_SECRETS" python3 server/tunnel_server.py 2525 > srv.log 2>&1 &
+          sleep 2
+          ss -ltnp 2>/dev/null | grep ':2525' && echo "server up" || { cat srv.log; exit 1; }
 
-      - name: Run Cloudflare Tunnel
+      - name: Open bore tunnel
         run: |
-          nohup cloudflared tunnel --config cloudflared.yml run > cf.log 2>&1 &
-          for i in $(seq 1 20); do grep -qiE "Registered tunnel connection" cf.log && break; sleep 2; done
-          tail -12 cf.log || true
+          nohup ./bore local 2525 --to bore.pub --port 24833 > bore.log 2>&1 &
+          for i in $(seq 1 30); do
+            EP=$(grep -oE 'bore\.pub:[0-9]+' bore.log | head -1)
+            [ -n "$EP" ] && break; sleep 1
+          done
+          [ -z "$EP" ] && { echo "no endpoint"; cat bore.log; exit 1; }
+          echo "ENDPOINT=$EP"; echo "$EP" > /tmp/ep.txt
 
-      - name: End-to-end test through the edge (real XHTTP client)
+      - name: Publish endpoint + keep alive (~5h48m), self-restart before the 6h cap
+        env:
+          PROXY_SECRET: ${{ secrets.PROXY_SECRET }}
+          PROXY_SECRETS: ${{ secrets.PROXY_SECRETS }}
+          # PAT with 'workflow' scope (or fine-grained Actions: read+write) on
+          # THIS repo. Needed because a run started by the default GITHUB_TOKEN
+          # cannot trigger another run - so we dispatch the successor with a PAT.
+          DISPATCH_PAT: ${{ secrets.DISPATCH_PAT }}
         run: |
-          cat > client_test.json <<'JSON'
-          {
-            "log": { "loglevel": "warning" },
-            "inbounds": [
-              { "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
-                "settings": { "udp": false } }
-            ],
-            "outbounds": [
-              {
-                "protocol": "vmess",
-                "settings": {
-                  "vnext": [{
-                    "address": "1.tsoolgee.uk",
-                    "port": 443,
-                    "users": [{ "id": "b7d37230-8508-4f0d-bd14-21d09c93eb9f",
-                                "alterId": 0, "security": "auto" }]
-                  }]
-                },
-                "streamSettings": {
-                  "network": "xhttp",
-                  "security": "tls",
-                  "tlsSettings": { "serverName": "1.tsoolgee.uk" },
-                  "xhttpSettings": { "path": "/xh", "host": "1.tsoolgee.uk", "mode": "packet-up" }
-                }
-              }
-            ]
+          git config user.name  proxy-bot
+          git config user.email proxy-bot@users.noreply.github.com
+
+          publish() {
+            git checkout -f main
+            git branch -D live 2>/dev/null || true
+            git checkout --orphan live
+            git reset >/dev/null 2>&1 || true
+            printf '{"endpoint":"%s","updated":"%s"}\n' "$1" "$(date -u +%FT%TZ)" > endpoint.json
+            git add -f endpoint.json
+            git commit -m "endpoint $1" >/dev/null
+            git push -f origin live
+            git checkout -f main
+            echo "published $1"
           }
-          JSON
-          nohup ./xray run -c client_test.json > client.log 2>&1 &
-          sleep 4
-          IP=$(curl -s --max-time 25 --socks5-hostname 127.0.0.1:10808 https://ipinfo.io/ip || true)
-          if [ -n "$IP" ]; then echo "E2E=OK egress_ip=$IP" | tee /home/runner/e2e.txt;
-          else echo "E2E=FAIL" | tee /home/runner/e2e.txt; tail -20 client.log; tail -20 xray.log; fi
-          pkill -f "client_test.json" || true
 
-      - name: Self-check + diagnostics
-        run: |
-          {
-            echo "=== E2E (runner -> edge -> xray) ==="; cat /home/runner/e2e.txt 2>/dev/null || echo "no result"
-            echo "=== TUNNEL_ID ==="; cat /home/runner/tunnel_id.txt
-            echo "=== local xray 8080/xh (bare GET, 404/400 is normal) ==="
-            curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/xh
-            echo "=== local decoy 8081/ ==="; curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8081/
-            for host in 1.tsoolgee.uk cdn.tsoolgee.uk; do
-              echo "=== edge $host / (decoy) ==="; curl -s -o /dev/null -w "%{http_code}\n" https://$host/ || true
-              echo "=== edge $host /xh (xray) ==="; curl -s -o /dev/null -w "%{http_code}\n" https://$host/xh || true
-              echo "=== edge $host /xh upgrade-free POST ==="
-              curl -s -o /dev/null -w "%{http_code} http_version=%{http_version}\n" \
-                   -X POST --data-binary "test" https://$host/xh/probe/0 || true
-            done
-            echo "=== cf registration ==="; grep -iE "Registered tunnel connection|error|unauthorized" cf.log | head -8
-          } > diag.txt 2>&1
-          cat diag.txt
+          # Start the successor run so it is queued and takes over the instant
+          # this job exits (concurrency cancel-in-progress:false keeps us alive
+          # while it waits). Dispatched ~18 min before the 6h hard cap so the
+          # cap can never kill us before the next run is armed.
+          dispatch_next() {
+            if [ -z "$DISPATCH_PAT" ]; then
+              echo "[warn] no DISPATCH_PAT secret - falling back to the 5h schedule only"
+              return
+            fi
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $DISPATCH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/proxy.yml/dispatches" \
+              -d '{"ref":"main"}')
+            echo "[self-restart] dispatched successor run -> HTTP $code"
+          }
 
-      - name: Upload diagnostics
-        uses: actions/upload-artifact@v4
-        with:
-          name: diag
-          path: diag.txt
-          retention-days: 1
+          LAST=$(cat /tmp/ep.txt)
+          publish "$LAST"
 
-      - name: Keep alive (~5h40m) + restart on death
-        run: |
-          for i in $(seq 1 340); do
-            pgrep -f "cloudflared tunnel" >/dev/null || { echo cf-restart; nohup cloudflared tunnel --config cloudflared.yml run >> cf.log 2>&1 & }
-            pgrep -f "xray run -c xray_config.json" >/dev/null || { echo xray-restart; nohup ./xray run -c xray_config.json >> xray.log 2>&1 & }
-            pgrep -f "decoy/serve.py" >/dev/null || { echo decoy-restart; nohup python3 decoy/serve.py 8081 >> decoy.log 2>&1 & }
+          armed=0
+          for i in $(seq 1 348); do
+            pgrep -f "bore local 2525"  >/dev/null || { echo cf-restart;  nohup ./bore local 2525 --to bore.pub --port 24833 >> bore.log 2>&1 & }
+            pgrep -f "tunnel_server.py" >/dev/null || { echo srv-restart; nohup env PROXY_SECRET="$PROXY_SECRET" PROXY_SECRETS="$PROXY_SECRETS" python3 server/tunnel_server.py 2525 >> srv.log 2>&1 & }
+            # if bore reconnected on a different port, republish so clients follow
+            CUR=$(grep -oE 'bore\.pub:[0-9]+' bore.log | tail -1)
+            if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ]; then
+              echo "bore port changed: $LAST -> $CUR"
+              publish "$CUR"; LAST="$CUR"
+            fi
+            # arm the next run once, ~18 min before we exit
+            if [ "$i" -eq 330 ] && [ "$armed" -eq 0 ]; then
+              dispatch_next; armed=1
+            fi
             sleep 60
           done
+          echo "==== srv.log tail ===="; tail -60 srv.log
