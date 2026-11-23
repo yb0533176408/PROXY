@@ -49,11 +49,41 @@ jobs:
 
       - name: Open bore tunnel
         run: |
-          nohup ./bore local 2525 --to bore.pub --port 24833 > bore.log 2>&1 &
-          for i in $(seq 1 30); do
-            EP=$(grep -oE 'bore\.pub:[0-9]+' bore.log | head -1)
-            [ -n "$EP" ] && break; sleep 1
+          # Try the pinned port (clients default to it) with retries: right after
+          # the previous run exits, bore.pub may still hold the port
+          # ("port already in use"), and bore.pub itself is sometimes slow to
+          # answer. After the pinned attempts, fall back to a random port - the
+          # clients follow it via live/endpoint.json (published below).
+          try_bore() {  # $1 = extra args ("--port 24833" or "")
+            pkill -f "bore local 2525" 2>/dev/null || true
+            sleep 1
+            : > bore.log
+            nohup ./bore local 2525 --to bore.pub $1 > bore.log 2>&1 &
+            BPID=$!
+            for s in $(seq 1 25); do
+              EP=$(grep -oE 'bore\.pub:[0-9]+' bore.log | head -1)
+              [ -n "$EP" ] && return 0
+              kill -0 "$BPID" 2>/dev/null || break   # bore exited -> failed fast
+              sleep 1
+            done
+            return 1
+          }
+
+          EP=""
+          for attempt in $(seq 1 8); do
+            echo "[bore] attempt $attempt on pinned port 24833"
+            try_bore "--port 24833" && break
+            echo "[bore] failed:"; cat bore.log
+            sleep 20
           done
+          if [ -z "$EP" ]; then
+            echo "[bore] pinned port unavailable - falling back to a random port"
+            for attempt in 1 2 3; do
+              try_bore "" && break
+              echo "[bore] random-port attempt $attempt failed:"; cat bore.log
+              sleep 10
+            done
+          fi
           [ -z "$EP" ] && { echo "no endpoint"; cat bore.log; exit 1; }
           echo "ENDPOINT=$EP"; echo "$EP" > /tmp/ep.txt
 
